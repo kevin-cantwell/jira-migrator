@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 
+	// yaml "gopkg.in/yaml.v2"
 	jira "github.com/andygrunwald/go-jira"
 )
 
@@ -16,6 +17,17 @@ var (
 func main() {
 	flag.StringVar(&configFile, "config", "config.json", "The configuration file to use.")
 	flag.StringVar(&configFile, "c", "config.json", "The configuration file to use.")
+	flag.Usage = func() {
+		fmt.Println(`Usage:
+	jira-migrator --config CONFIG [COMMAND] [OPTIONS]
+Options:
+	--config,-c	The configuration file to use. (default "config.json")
+Commands:
+	server		Authenticate using Jira Server credentials.
+	cloud		Authenticate using Jira Cloud credentials.
+`)
+	}
+	flag.Parse()
 
 	configFile, err := os.Open(configFile)
 	if err != nil {
@@ -44,7 +56,17 @@ func main() {
 		Config: config,
 	}
 
-	fmt.Println(clients.Config)
+	issue, resp, err := clients.Server.Issue.Get("GCPKAFKA-1913", &jira.GetQueryOptions{
+		FieldsByKeys: true,
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	_ = issue
+	_ = resp
+
+	json.NewEncoder(os.Stdout).Encode(issue)
 }
 
 type Clients struct {
