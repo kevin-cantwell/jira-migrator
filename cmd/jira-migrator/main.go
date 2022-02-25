@@ -53,10 +53,12 @@ func main() {
 
 					// migrate issues in the order they were returned from the query
 					for _, issue := range issues {
-						fmt.Println(issue.Key)
-						if _, err := app.MigrateIssue(&issue); err != nil {
+						fmt.Print(issue.Key)
+						toIssue, err := app.MigrateIssue(&issue)
+						if err != nil {
 							return err
 						}
+						fmt.Println("->", toIssue.Key)
 					}
 
 					return nil
@@ -158,6 +160,23 @@ func (app *App) QueryIssues(jql string) ([]jira.Issue, error) {
 	var issues []jira.Issue
 	if err := app.From.Issue.SearchPages(jql, &jira.SearchOptions{
 		Expand: "names",
+		Fields: []string{
+			"project",
+			"summary",
+			"status",
+			"description",
+			"created",
+			"updated",
+			"resolutiondate",
+			"issuelinks",
+			"issuetype",
+			"labels",
+			"assignee",
+			"reporter",
+			"comment",
+			"attachment",
+			"priority",
+		},
 	}, func(issue jira.Issue) error {
 		issues = append(issues, issue)
 		return nil
@@ -234,9 +253,10 @@ func (app *App) MigrateIssue(issue *jira.Issue) (*jira.Issue, error) {
 
 	// Attachments can't be set on create, they must be downloaded and posted later
 	for _, attachment := range issue.Fields.Attachments {
-		resp, err := http.Get(attachment.Content)
+		req, _ := http.NewRequest("GET", attachment.Content, nil)
+		resp, err := app.From.Do(req, nil)
 		if err != nil {
-			dumpResponse(&jira.Response{Response: resp})
+			dumpResponse(resp)
 			return nil, errors.Wrapf(err, "Error fetching attachment %q from issue %s", attachment.Filename, issue.Key)
 		}
 		defer resp.Body.Close()
