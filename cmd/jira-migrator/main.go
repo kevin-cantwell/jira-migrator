@@ -1,11 +1,13 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/pkg/errors"
 
@@ -27,6 +29,10 @@ func main() {
 				Value:   "config.yaml",
 				Usage:   "The configuration file to use.",
 			},
+			&cli.BoolFlag{
+				Name:  "dryrun",
+				Usage: "Run through all the migration steps without creating anything on the \"to\" server.",
+			},
 		},
 		Commands: []*cli.Command{
 			{
@@ -41,24 +47,32 @@ func main() {
 				},
 				Action: func(c *cli.Context) error {
 					c.String("config")
-					app, err := NewApp(c.String("config"))
+					app, err := NewApp(c.String("config"), c.Bool("dryrun"))
 					if err != nil {
-						return err
+						return errors.Wrap(err, "unable to configure app")
 					}
 
-					issues, err := app.QueryIssues(c.String("jql"))
+					meta, _, err := app.From.Issue.GetCreateMeta(app.Config.From.ProjectKey)
+					for _, p := range meta.Projects {
+						for _, it := range p.IssueTypes {
+							if it.Name == "Epic" {
+
+							}
+						}
+					}
+
+					issues, err := app.QueryIssues(app.From, c.String("jql"))
 					if err != nil {
-						return err
+						return errors.Wrap(err, "unable to query issues")
 					}
 
 					// migrate issues in the order they were returned from the query
 					for _, issue := range issues {
-						fmt.Print(issue.Key)
-						toIssue, err := app.MigrateIssue(&issue)
-						if err != nil {
-							return err
+						// b, _ := json.Marshal(issue.Fields.Unknowns)
+						// panic(string(b))
+						if _, err := app.MigrateIssue(&issue); err != nil {
+							return errors.Wrap(err, "unable to migrate issue")
 						}
-						fmt.Println("->", toIssue.Key)
 					}
 
 					return nil
@@ -108,10 +122,11 @@ type App struct {
 	From       *jira.Client
 	To         *jira.Client
 	Config     Config
+	DryRun     bool
 	UserLookup map[string]jira.User
 }
 
-func NewApp(pathToConfig string) (*App, error) {
+func NewApp(pathToConfig string, dryrun bool) (*App, error) {
 	configFile, err := os.Open(pathToConfig)
 	if err != nil {
 		return nil, err
@@ -152,13 +167,14 @@ func NewApp(pathToConfig string) (*App, error) {
 		From:       from,
 		To:         to,
 		Config:     config,
+		DryRun:     dryrun,
 		UserLookup: userLookup,
 	}, nil
 }
 
-func (app *App) QueryIssues(jql string) ([]jira.Issue, error) {
+func (app *App) QueryIssues(client *jira.Client, jql string) ([]jira.Issue, error) {
 	var issues []jira.Issue
-	if err := app.From.Issue.SearchPages(jql, &jira.SearchOptions{
+	if err := client.Issue.SearchPages(jql, &jira.SearchOptions{
 		Expand: "names",
 		Fields: []string{
 			"project",
@@ -166,6 +182,7 @@ func (app *App) QueryIssues(jql string) ([]jira.Issue, error) {
 			"status",
 			"description",
 			"created",
+			"creator",
 			"updated",
 			"resolutiondate",
 			"issuelinks",
@@ -176,28 +193,176 @@ func (app *App) QueryIssues(jql string) ([]jira.Issue, error) {
 			"comment",
 			"attachment",
 			"priority",
+			"parent",
+			"subtasks",
+			"customfield_10620", // epic
 		},
 	}, func(issue jira.Issue) error {
 		issues = append(issues, issue)
 		return nil
 	}); err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "unable to search pages")
 	}
 	return issues, nil
 }
 
-func (app *App) MigrateIssue(issue *jira.Issue) (*jira.Issue, error) {
+/*
+	Attempts to recursively migrate an issue's entire family tree.
+	The family tree of each parent, epic, and subtask will also be migrated.
+	An attempt is made to migrate keys in the same order in which they appear in
+	the "from" server (ie: earliest keys get migrated first)
+*/
+func (app *App) MigrateFamilyTree(issue *jira.Issue) error {
+	// recursively travel up the family tree and migrate all parents
+	parent, err := app.GetParent(issue)
+	if err != nil {
+		return errors.Wrap(err, "unable to get parent")
+	}
+	if parent != nil {
+		// migrating the parent's family tree will also result in `issue`
+		// being migrated, so we can return here
+		return app.MigrateFamilyTree(parent)
+	}
+
+	// If no parents, migrate the issue and any children it may have
+
+	migratedKey, err := app.MigrateIssue(issue)
+	if err != nil {
+		return errors.Wrap(err, "unable to migrate issue")
+	}
+
+	opts := &MigrateOptions{}
+	if issue.Fields.Type.Name == "Epic" {
+		opts.MigratedEpicKey = migratedKey
+	} else {
+		opts.MigratedParentKey = migratedKey
+	}
+
+	return app.MigrateChildren(issue, opts)
+}
+
+func (app *App) MigrateChildren(parent *jira.Issue, opts *MigrateOptions) error {
+	// If its an epic, migrate its issues and any of thier children
+	if parent.Fields.Type.Name == "Epic" {
+		children, err := app.QueryIssues(app.From, `"Epic Link" = `+parent.Key+` ORDER BY key`)
+		if err != nil {
+			return errors.Wrap(err, "unable to query epic children")
+		}
+		for _, child := range children {
+			migratedKey, err := app.MigrateIssue(&child)
+			if err != nil {
+				return errors.Wrap(err, "unable to migrate child")
+			}
+			child.Fields.Parent = &jira.Parent{
+				Key: opts.MigratedEpicKey,
+			}
+			if _, _, err := app.To.Issue.Update(&child); err != nil {
+				return errors.Wrap(err, "unable to link epic")
+			}
+			if err := app.MigrateChildren(&child, &MigrateOptions{
+				MigratedEpicKey: migratedKey,
+			}); err != nil {
+				return errors.Wrap(err, "unable to migrate children's children")
+			}
+		}
+		return nil
+	}
+
+	// If it has subtasks, migrate them
+	if len(parent.Fields.Subtasks) > 0 {
+		children, err := app.QueryIssues(app.From, `parent in ("`+parent.Key+`") ORDER BY key`)
+		if err != nil {
+			return errors.Wrap(err, "unable to query subtasks")
+		}
+		for _, child := range children {
+			if _, err := app.MigrateIssue(&child); err != nil {
+				return errors.Wrap(err, "unable to migrate subtask")
+			}
+			child.Fields.Parent = &jira.Parent{
+				Key: opts.MigratedParentKey,
+			}
+			if _, _, err := app.To.Issue.Update(&child); err != nil {
+				return errors.Wrap(err, "unable to link pages")
+			}
+		}
+	}
+
+	return nil
+}
+
+func (app *App) GetParent(issue *jira.Issue) (*jira.Issue, error) {
+	var parentKey string
+	if parent := issue.Fields.Parent; parent != nil {
+		parentKey = parent.Key
+	}
+	if epicKey := epicLink(issue); epicKey != "" {
+		parentKey = epicKey
+	}
+	if parentKey == "" {
+		return nil, nil
+	}
+
+	parents, err := app.QueryIssues(app.From, `issue = `+parentKey)
+	if err != nil {
+		return nil, err
+	}
+	if len(parents) == 0 {
+		return nil, nil
+	}
+
+	// there can only be one parent
+	return &parents[0], nil
+}
+
+type MigrateOptions struct {
+	MigratedParentKey string
+	MigratedEpicKey   string
+}
+
+func (app *App) MigrateIssue(issue *jira.Issue) (string, error) {
+	// First, check to see if this issue has already been migrated, and skip if so.
+	migrated, err := app.QueryIssues(app.To, `issue in issuesWithRemoteLinksByGlobalId("`+issue.Key+`") ORDER BY key DESC`)
+	if err != nil {
+		return "", err
+	}
+	if len(migrated) > 0 {
+		fmt.Println(issue.Key, "already migrated at", time.Time(migrated[0].Fields.Created).Format("2006-01-02 15:04")+". Skipping.")
+		// return migrated[0].Key, nil
+	}
+
+	fmt.Println("Migrating", issue.Key, "...")
+
+	// TODO: Match priorities
+
 	newIssue := jira.Issue{
 		Fields: &jira.IssueFields{
 			Project: jira.Project{
 				Key: app.Config.To.ProjectKey,
 			},
 			Type: jira.IssueType{
-				Name: issue.Fields.Type.Name,
+				Name:    issue.Fields.Type.Name,
+				Subtask: issue.Fields.Type.Subtask,
 			},
 			Summary:     issue.Fields.Summary,
 			Description: issue.Fields.Description,
+			Priority:    issue.Fields.Priority,
+			Labels:      issue.Fields.Labels,
 		},
+	}
+
+	// If it's a subtask or has an epic, migrate its parent first.
+	parent, err := app.GetParent(issue)
+	if err != nil {
+		return "", errors.Wrap(err, "unable to fetch parent")
+	}
+	if parent != nil {
+		migratedParentKey, err := app.MigrateIssue(parent)
+		if err != nil {
+			return "", errors.Wrap(err, "unable to migrate issue")
+		}
+		newIssue.Fields.Parent = &jira.Parent{
+			Key: migratedParentKey,
+		}
 	}
 
 	if reporter := issue.Fields.Reporter; reporter != nil {
@@ -214,13 +379,19 @@ func (app *App) MigrateIssue(issue *jira.Issue) (*jira.Issue, error) {
 		}
 	}
 
+	if app.DryRun {
+		fmt.Println("Successfully migrated", issue.Key, "to", "DRYRUN-1")
+		return "DRYRUN-1", nil
+	}
+
 	createdIssue, resp, err := app.To.Issue.Create(&newIssue)
 	if err != nil {
 		dumpResponse(resp)
-		return nil, errors.Wrap(err, "Error creating issue")
+		return "", errors.Wrap(err, "Error creating issue")
 	}
 
 	if _, resp, err := app.To.Issue.AddRemoteLink(createdIssue.ID, &jira.RemoteLink{
+		GlobalID: issue.Key,
 		Application: &jira.RemoteLinkApplication{
 			Type: "jira.etsycorp.com",
 			Name: "Migrated Issue",
@@ -232,7 +403,7 @@ func (app *App) MigrateIssue(issue *jira.Issue) (*jira.Issue, error) {
 		},
 	}); err != nil {
 		dumpResponse(resp)
-		return nil, errors.Wrap(err, "Error creating remote link")
+		return "", errors.Wrap(err, "Error creating remote link")
 	}
 
 	// Comments can't be set on create. They must be added later
@@ -242,11 +413,11 @@ func (app *App) MigrateIssue(issue *jira.Issue) (*jira.Issue, error) {
 				Name: comment.Name,
 				// It's impossible to set a different author than "self",
 				// so just indicate who wrote this originally in the body of the comment.
-				Body:       comment.Author.EmailAddress + " wrote:\n\n" + comment.Body,
+				Body:       "On " + comment.Created + " " + comment.Author.EmailAddress + " wrote:\n\n" + comment.Body,
 				Visibility: comment.Visibility,
 			}); err != nil {
 				dumpResponse(resp)
-				return nil, errors.Wrapf(err, "Error adding comment to %s", createdIssue.Key)
+				return "", errors.Wrapf(err, "Error adding comment to %s", createdIssue.Key)
 			}
 		}
 	}
@@ -257,75 +428,41 @@ func (app *App) MigrateIssue(issue *jira.Issue) (*jira.Issue, error) {
 		resp, err := app.From.Do(req, nil)
 		if err != nil {
 			dumpResponse(resp)
-			return nil, errors.Wrapf(err, "Error fetching attachment %q from issue %s", attachment.Filename, issue.Key)
+			return "", errors.Wrapf(err, "Error fetching attachment %q from issue %s", attachment.Filename, issue.Key)
 		}
 		defer resp.Body.Close()
 		if _, resp, err := app.To.Issue.PostAttachment(createdIssue.ID, resp.Body, attachment.Filename); err != nil {
 			dumpResponse(resp)
-			return nil, errors.Wrapf(err, "Error posting attachment %q to issue %s", attachment.Filename, createdIssue.Key)
+			return "", errors.Wrapf(err, "Error posting attachment %q to issue %s", attachment.Filename, createdIssue.Key)
 		}
 	}
 
 	// Transition the ticket to the correct status
 	transitions, resp, err := app.To.Issue.GetTransitions(createdIssue.ID)
 	if err != nil {
-		return nil, errors.Wrapf(err, "Error fetching transitions for %s", createdIssue.Key)
+		return "", errors.Wrapf(err, "Error fetching transitions for %s", createdIssue.Key)
 	}
 	for _, transition := range transitions {
 		if transition.To.Name == issue.Fields.Status.Name {
 			if resp, err := app.To.Issue.DoTransition(createdIssue.ID, transition.ID); err != nil {
 				dumpResponse(resp)
-				return nil, errors.Wrapf(err, "Error transitioning issue %s to %q", createdIssue.Key, transition.To.Name)
+				return "", errors.Wrapf(err, "Error transitioning issue %s to %q", createdIssue.Key, transition.To.Name)
 			}
 		}
 	}
 
-	// // Migrate all linked issues
-	// for _, link := range issue.Fields.IssueLinks {
-	// 	fmt.Printf("%+v\n", link)
-	// 	// only link outwardly to avoid dupes
-	// 	outward := link.OutwardIssue
-	// 	if outward != nil && outward.Key != issue.Key {
-	// 		outwardIssue, resp, err := app.Server.Issue.Get(outward.Key, &jira.GetQueryOptions{
-	// 			FieldsByKeys: true,
-	// 			Expand:       "names",
-	// 		})
-	// 		if err != nil {
-	// 			return nil, errors.Wrapf(err, "Error fetching outward link %s", outward.Key)
-	// 		}
-	// 		createdOutwardIssue, resp, err := app.MigrateIssue(nil, outwardIssue)
-	// 		if err != nil {
-	// 			return nil, errors.Wrapf(err, "Error migrating outward link %s", outward.Key)
-	// 		}
-	// 		app.To.Issue.AddLink(&jira.IssueLink{
-	// 			Type:         link.Type,
-	// 			OutwardIssue: createdOutwardIssue,
-	// 			InwardIssue:  createdIssue,
-	// 			// Comment:      link.Comment, // Too annoying to deal with right now (my god jira is complex)
-	// 		})
-	// 	}
-	// }
+	fmt.Println("Successfully migrated", issue.Key, "to", createdIssue.Key)
 
-	// Migrate all subtasks
-	// for _, subtask := range issue.Fields.Subtasks {
-	// 	subIssue, resp, err := app.From.Issue.Get(subtask.Key, &jira.GetQueryOptions{
-	// 		FieldsByKeys: true,
-	// 		Expand:       "names",
-	// 	})
-	// 	if err != nil {
-	// 		return nil, errors.Wrapf(err, "Error fetching subtask %s", subtask.Key)
-	// 	}
-	// 	if _, resp, err := app.MigrateIssue(createdIssue, subIssue); err != nil {
-	// 		return nil, errors.Wrapf(err, "Error migrating subtask %s", subIssue.Key)
-	// 	}
-	// }
+	return createdIssue.Key, nil
+}
 
-	// // Migrate all epic children
-	// if issue.Fields.Type.Name == "Epic" {
-	// 	issue.Fields.
-	// }
-
-	return createdIssue, nil
+func epicLink(issue *jira.Issue) string {
+	if field, ok := issue.Fields.Unknowns["customfield_10620"]; ok {
+		if epicKey, ok := field.(string); ok {
+			return epicKey
+		}
+	}
+	return ""
 }
 
 func getUsers(cloud *jira.Client, projectKey string) ([]jira.User, error) {
@@ -354,4 +491,33 @@ func getUsers(cloud *jira.Client, projectKey string) ([]jira.User, error) {
 		}
 	}
 	return users, nil
+}
+
+func (app *App) BuildTree(issue *jira.Issue) error {
+	parent, err := app.GetParent(issue)
+	if err != nil {
+		return err
+	}
+	panic(parent)
+}
+
+var tree map[string]*Node
+
+type Node struct {
+	Issue    *jira.Issue
+	Parent   *jira.Issue
+	Chidren  []jira.Issue
+	Migrated *jira.Issue
+}
+
+type Issue struct {
+	Expand         string                    `json:"expand,omitempty" structs:"expand,omitempty"`
+	ID             string                    `json:"id,omitempty" structs:"id,omitempty"`
+	Self           string                    `json:"self,omitempty" structs:"self,omitempty"`
+	Key            string                    `json:"key,omitempty" structs:"key,omitempty"`
+	Fields         json.RawMessage           `json:"fields,omitempty" structs:"fields,omitempty"`
+	RenderedFields *jira.IssueRenderedFields `json:"renderedFields,omitempty" structs:"renderedFields,omitempty"`
+	Changelog      *jira.Changelog           `json:"changelog,omitempty" structs:"changelog,omitempty"`
+	Transitions    []jira.Transition         `json:"transitions,omitempty" structs:"transitions,omitempty"`
+	Names          map[string]string         `json:"names,omitempty" structs:"names,omitempty"`
 }
