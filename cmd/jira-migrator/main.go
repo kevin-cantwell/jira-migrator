@@ -1,14 +1,20 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"sync"
+	"time"
 
 	"github.com/pkg/errors"
+	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/singleflight"
+	"golang.org/x/time/rate"
 
 	jira "github.com/andygrunwald/go-jira"
 	cli "github.com/urfave/cli/v2"
@@ -84,7 +90,7 @@ func main() {
 
 					if err := client.Issue.SearchPages(c.String("jql"), &jira.SearchOptions{
 						Expand: "names",
-						Fields: SearchFields,
+						Fields: DefaultSearchFields,
 					}, func(issue jira.Issue) error {
 						b, err := json.Marshal(issue)
 						if err != nil {
@@ -115,6 +121,13 @@ func main() {
 				},
 				ArgsUsage: "PROJECT_KEY",
 				Action: func(c *cli.Context) error {
+					var (
+						config     Config
+						projectKey = c.Args().First()
+						errg       errgroup.Group
+						issues     = make(chan jira.Issue)
+					)
+
 					if c.NArg() == 0 {
 						return errors.New("must specify a project key")
 					}
@@ -124,43 +137,50 @@ func main() {
 						return err
 					}
 
-					var config Config
 					if err := yaml.NewDecoder(configFile).Decode(&config); err != nil {
 						return err
 					}
-
-					projectKey := c.Args().First()
 
 					app, err := NewMigratorApp(projectKey, config)
 					if err != nil {
 						return errors.Wrap(err, "unable to configure app")
 					}
 
-					issues, err := app.QueryIssues(app.From, c.String("jql"))
-					if err != nil {
-						return errors.Wrap(err, "unable to query issues")
-					}
+					errg.Go(func() error {
+						defer close(issues)
 
-					progress := &Progress{
-						migrated: map[string]string{},
-						parents:  map[string]string{},
-					}
+						if err := app.From.Issue.SearchPages(c.String("jql"), &jira.SearchOptions{
+							Expand: "names",
+							Fields: DefaultSearchFields,
+						}, func(issue jira.Issue) error {
+							issues <- issue
+							return nil
+						}); err != nil {
+							return errors.Wrap(err, "unable to search pages")
+						}
+						return nil
+					})
 
-					// migrate issues in the order they were returned from the query
-					for _, issue := range issues {
-						if err := app.MigrateParents(&issue, progress); err != nil {
-							return errors.Wrap(err, "unable to migrate parents")
-						}
-						if _, err := app.MigrateIssue(&issue, progress); err != nil {
-							return errors.Wrap(err, "unable to migrate issue")
-						}
-						if c.Bool("children") {
-							if err := app.MigrateChildren(&issue, progress); err != nil {
-								return errors.Wrap(err, "unable to migrate children")
+					for issue := range issues {
+						issue := issue // avoid loop closure captures
+
+						errg.Go(func() error {
+							if err := app.MigrateParents(&issue); err != nil {
+								return errors.Wrap(err, "unable to migrate parents")
 							}
-						}
+							if _, err := app.MigrateIssue(&issue); err != nil {
+								return errors.Wrap(err, "unable to migrate issue")
+							}
+							if c.Bool("children") {
+								if err := app.MigrateChildren(&issue); err != nil {
+									return errors.Wrap(err, "unable to migrate children")
+								}
+							}
+							return nil
+						})
 					}
-					return nil
+
+					return errg.Wait()
 				},
 			},
 		},
@@ -181,38 +201,81 @@ func respErrExit(resp *jira.Response, err error) {
 
 func dumpResponse(resp *jira.Response) {
 	if resp != nil {
+		fmt.Println("X-Ratelimit-Limit:", resp.Header.Get("X-Ratelimit-Limit"))
+		fmt.Println("X-Ratelimit-Remaining:", resp.Header.Get("X-Ratelimit-Remaining"))
+		fmt.Println("X-Ratelimit-Reset:", resp.Header.Get("X-Ratelimit-Reset"))
 		io.Copy(os.Stderr, resp.Body)
 		fmt.Fprint(os.Stderr, "\n")
 	}
 }
 
+type ErrorResponse struct {
+	// {"errorMessages":["This Jira instance is currently under heavy load and is not able to process your request. Try again in a few seconds. If the problem persists, contact Jira support."],"errors":{}}
+	ErrorMessages []string    `json:"errorMessages"`
+	Errors        interface{} `json:"errors"`
+}
+
+func NewProgress() *Progress {
+	return &Progress{
+		migrating: map[string]bool{},
+		migrated:  map[string]string{},
+		parents:   map[string]string{},
+	}
+}
+
 type Progress struct {
-	migrated map[string]string
-	parents  map[string]string
+	mu        sync.RWMutex
+	migrating map[string]bool
+	migrated  map[string]string
+	parents   map[string]string
+}
+
+func (p *Progress) MarkMigrating(from string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.migrating[from] = true
+}
+
+func (p *Progress) IsMigrating(from string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.migrating[from]
 }
 
 func (p *Progress) MarkMigrated(from, to string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.migrated[from] = to
 }
 
 func (p *Progress) MarkMigratedParent(from, toParent string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.parents[from] = toParent
 }
 
 func (p *Progress) MigratedKey(from string) string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	return p.migrated[from]
 }
 
 func (p *Progress) MigratedParentKey(from string) string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	return p.parents[from]
 }
 
 func (p *Progress) IsMigrated(from string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	_, ok := p.migrated[from]
 	return ok
 }
 
 func (p *Progress) IsParentMigrated(from string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	_, ok := p.parents[from]
 	return ok
 }
@@ -236,6 +299,8 @@ type MigratorApp struct {
 	ProjectKey string
 	// Config     Config
 	UserLookup map[string]jira.User
+	Progress   *Progress
+	ApiLimiter *rate.Limiter
 }
 
 func NewMigratorApp(projectKey string, config Config) (*MigratorApp, error) {
@@ -270,10 +335,12 @@ func NewMigratorApp(projectKey string, config Config) (*MigratorApp, error) {
 		To:         to,
 		ProjectKey: projectKey,
 		UserLookup: userLookup,
+		Progress:   NewProgress(),
+		ApiLimiter: rate.NewLimiter(rate.Limit(100*time.Millisecond), 2),
 	}, nil
 }
 
-var SearchFields = []string{
+var DefaultSearchFields = []string{
 	"project",
 	"summary",
 	"status",
@@ -296,11 +363,11 @@ var SearchFields = []string{
 	"customfield_10621", // epic name
 }
 
-func (app *MigratorApp) QueryIssues(client *jira.Client, jql string) ([]jira.Issue, error) {
+func (app *MigratorApp) QueryIssues(client *jira.Client, jql string, fields ...string) ([]jira.Issue, error) {
 	var issues []jira.Issue
 	if err := client.Issue.SearchPages(jql, &jira.SearchOptions{
 		Expand: "names",
-		Fields: SearchFields,
+		Fields: DefaultSearchFields,
 	}, func(issue jira.Issue) error {
 		issues = append(issues, issue)
 		return nil
@@ -310,7 +377,8 @@ func (app *MigratorApp) QueryIssues(client *jira.Client, jql string) ([]jira.Iss
 	return issues, nil
 }
 
-func (app *MigratorApp) MigrateChildren(parent *jira.Issue, progress *Progress) (err error) {
+// Safe for concurrent use.
+func (app *MigratorApp) MigrateChildren(parent *jira.Issue) (err error) {
 	var children []jira.Issue
 	// If its an epic, migrate its issues and any of thier children
 	if parent.Fields.Type.Name == "Epic" {
@@ -326,18 +394,28 @@ func (app *MigratorApp) MigrateChildren(parent *jira.Issue, progress *Progress) 
 		}
 	}
 
+	// we can migrate each child concurrently
+	var errg errgroup.Group
+
 	for _, child := range children {
-		progress.MarkMigratedParent(child.Key, progress.MigratedKey(parent.Key))
-		_, err := app.MigrateIssue(&child, progress)
-		if err != nil {
-			return errors.Wrap(err, "unable to migrate child")
-		}
-		if err := app.MigrateChildren(&child, progress); err != nil {
-			return errors.Wrap(err, "unable to migrate children's children")
-		}
+		child := child // avoid loop closure captures
+
+		// Depends on the parent being migrated already
+		app.Progress.MarkMigratedParent(child.Key, app.Progress.MigratedKey(parent.Key))
+
+		errg.Go(func() error {
+			_, err := app.MigrateIssue(&child)
+			if err != nil {
+				return errors.Wrap(err, "unable to migrate child")
+			}
+			if err := app.MigrateChildren(&child); err != nil {
+				return errors.Wrap(err, "unable to migrate children's children")
+			}
+			return nil
+		})
 	}
 
-	return nil
+	return errg.Wait()
 }
 
 func (app *MigratorApp) GetParent(issue *jira.Issue) (*jira.Issue, error) {
@@ -377,37 +455,45 @@ func (app *MigratorApp) GetParent(issue *jira.Issue) (*jira.Issue, error) {
 // }
 
 // Migrates every parent up to root, but doesn't bother with siblings or cousins
-func (app *MigratorApp) MigrateParents(issue *jira.Issue, progress *Progress) error {
+func (app *MigratorApp) MigrateParents(issue *jira.Issue) error {
 	parent, err := app.GetParent(issue)
 	if err != nil {
 		errors.Wrap(err, "unable to get parent")
 	}
 	if parent != nil {
-		if err := app.MigrateParents(parent, progress); err != nil {
+		if err := app.MigrateParents(parent); err != nil {
 			return err
 		}
-		migratedParentKey, err := app.MigrateIssue(parent, progress)
+		migratedParentKey, err := app.MigrateIssue(parent)
 		if err != nil {
 			return err
 		}
-		progress.MarkMigratedParent(issue.Key, migratedParentKey)
+		app.Progress.MarkMigratedParent(issue.Key, migratedParentKey)
 	}
 	return nil
 }
 
-func (app *MigratorApp) MigrateIssue(issue *jira.Issue, progress *Progress) (key string, err error) {
+// Ensures that we only migrate each issue once without having to implement fancy
+// deduplication logic for this unit of work
+var migrateIssueGroup singleflight.Group
+
+func (app *MigratorApp) MigrateIssue(issue *jira.Issue) (string, error) {
+	app.ApiLimiter.Wait(context.Background())
+
+	key, err, _ := migrateIssueGroup.Do(issue.Key, func() (interface{}, error) {
+		return app.migrateIssue(issue)
+	})
+	return key.(string), err
+}
+
+func (app *MigratorApp) migrateIssue(issue *jira.Issue) (key string, err error) {
 	defer func() {
 		if err == nil {
-			progress.MarkMigrated(issue.Key, key)
+			app.Progress.MarkMigrated(issue.Key, key)
 		}
 	}()
 
 	fmt.Println("Migrating", issue.Key, "...")
-
-	if progress.IsMigrated(issue.Key) {
-		fmt.Println(issue.Key, "already migrated "+issue.Key+". Skipping.")
-		return progress.MigratedKey(issue.Key), nil
-	}
 
 	// First, check to see if this issue has already been migrated, and skip if so.
 	migratedIssues, err := app.QueryIssues(app.To, `issue in issuesWithRemoteLinksByGlobalId("`+issue.Key+`") ORDER BY key DESC`)
@@ -461,9 +547,9 @@ func (app *MigratorApp) MigrateIssue(issue *jira.Issue, progress *Progress) (key
 		}
 	}
 
-	if progress.IsParentMigrated(issue.Key) {
+	if app.Progress.IsParentMigrated(issue.Key) {
 		newIssue.Fields.Parent = &jira.Parent{
-			Key: progress.MigratedParentKey(issue.Key),
+			Key: app.Progress.MigratedParentKey(issue.Key),
 		}
 	}
 
@@ -473,65 +559,84 @@ func (app *MigratorApp) MigrateIssue(issue *jira.Issue, progress *Progress) (key
 		return "", errors.Wrap(err, "Error creating issue")
 	}
 
-	if _, resp, err := app.To.Issue.AddRemoteLink(migrated.ID, &jira.RemoteLink{
-		GlobalID: issue.Key,
-		Application: &jira.RemoteLinkApplication{
-			Type: "jira.etsycorp.com",
-			Name: "Migrated Issue",
-		},
-		Object: &jira.RemoteLinkObject{
-			URL:     "https://jira.etsycorp.com/browse/" + issue.Key,
-			Title:   issue.Key,
-			Summary: issue.Fields.Summary,
-		},
-	}); err != nil {
-		dumpResponse(resp)
-		return "", errors.Wrap(err, "Error creating remote link")
-	}
+	errg := errgroup.Group{}
 
-	// Comments can't be set on create. They must be added later
-	if issue.Fields.Comments != nil {
-		for _, comment := range issue.Fields.Comments.Comments {
-			if _, resp, err := app.To.Issue.AddComment(migrated.ID, &jira.Comment{
-				Name: comment.Name,
-				// It's impossible to set a different author than "self",
-				// so just indicate who wrote this originally in the body of the comment.
-				Body:       "On " + comment.Created + " " + comment.Author.EmailAddress + " wrote:\n\n" + comment.Body,
-				Visibility: comment.Visibility,
-			}); err != nil {
-				dumpResponse(resp)
-				return "", errors.Wrapf(err, "Error adding comment to %s", migrated.Key)
+	errg.Go(func() error {
+		if _, resp, err := app.To.Issue.AddRemoteLink(migrated.ID, &jira.RemoteLink{
+			GlobalID: issue.Key,
+			Application: &jira.RemoteLinkApplication{
+				Type: "jira.etsycorp.com",
+				Name: "Migrated Issue",
+			},
+			Object: &jira.RemoteLinkObject{
+				URL:     "https://jira.etsycorp.com/browse/" + issue.Key,
+				Title:   issue.Key,
+				Summary: issue.Fields.Summary,
+			},
+		}); err != nil {
+			dumpResponse(resp)
+			return errors.Wrap(err, "Error creating remote link")
+		}
+		return nil
+	})
+
+	errg.Go(func() error {
+		// Comments can't be set on create. They must be added later
+		if issue.Fields.Comments != nil {
+			for _, comment := range issue.Fields.Comments.Comments {
+				if _, resp, err := app.To.Issue.AddComment(migrated.ID, &jira.Comment{
+					Name: comment.Name,
+					// It's impossible to set a different author than "self",
+					// so just indicate who wrote this originally in the body of the comment.
+					Body:       "On " + comment.Created + " " + comment.Author.EmailAddress + " wrote:\n\n" + comment.Body,
+					Visibility: comment.Visibility,
+				}); err != nil {
+					dumpResponse(resp)
+					return errors.Wrapf(err, "Error adding comment to %s", migrated.Key)
+				}
 			}
 		}
-	}
+		return nil
+	})
 
-	// Attachments can't be set on create, they must be downloaded and posted later
-	for _, attachment := range issue.Fields.Attachments {
-		req, _ := http.NewRequest("GET", attachment.Content, nil)
-		resp, err := app.From.Do(req, nil)
+	errg.Go(func() error {
+		// Attachments can't be set on create, they must be downloaded and posted later
+		for _, attachment := range issue.Fields.Attachments {
+			req, _ := http.NewRequest("GET", attachment.Content, nil)
+			resp, err := app.From.Do(req, nil)
+			if err != nil {
+				dumpResponse(resp)
+				return errors.Wrapf(err, "Error fetching attachment %q from issue %s", attachment.Filename, issue.Key)
+			}
+			defer resp.Body.Close()
+			if _, resp, err := app.To.Issue.PostAttachment(migrated.ID, resp.Body, attachment.Filename); err != nil {
+				dumpResponse(resp)
+				return errors.Wrapf(err, "Error posting attachment %q to issue %s", attachment.Filename, migrated.Key)
+			}
+		}
+		return nil
+	})
+
+	errg.Go(func() error {
+		// Transition the ticket to the correct status
+		transitions, resp, err := app.To.Issue.GetTransitions(migrated.ID)
 		if err != nil {
 			dumpResponse(resp)
-			return "", errors.Wrapf(err, "Error fetching attachment %q from issue %s", attachment.Filename, issue.Key)
+			return errors.Wrapf(err, "Error fetching transitions for %s", migrated.Key)
 		}
-		defer resp.Body.Close()
-		if _, resp, err := app.To.Issue.PostAttachment(migrated.ID, resp.Body, attachment.Filename); err != nil {
-			dumpResponse(resp)
-			return "", errors.Wrapf(err, "Error posting attachment %q to issue %s", attachment.Filename, migrated.Key)
-		}
-	}
-
-	// Transition the ticket to the correct status
-	transitions, resp, err := app.To.Issue.GetTransitions(migrated.ID)
-	if err != nil {
-		return "", errors.Wrapf(err, "Error fetching transitions for %s", migrated.Key)
-	}
-	for _, transition := range transitions {
-		if transition.To.Name == issue.Fields.Status.Name {
-			if resp, err := app.To.Issue.DoTransition(migrated.ID, transition.ID); err != nil {
-				dumpResponse(resp)
-				return "", errors.Wrapf(err, "Error transitioning issue %s to %q", migrated.Key, transition.To.Name)
+		for _, transition := range transitions {
+			if transition.To.Name == issue.Fields.Status.Name {
+				if resp, err := app.To.Issue.DoTransition(migrated.ID, transition.ID); err != nil {
+					dumpResponse(resp)
+					return errors.Wrapf(err, "Error transitioning issue %s to %q", migrated.Key, transition.To.Name)
+				}
 			}
 		}
+		return nil
+	})
+
+	if err := errg.Wait(); err != nil {
+		return "", errors.Wrapf(err, "Error migrating %s", issue.Key)
 	}
 
 	fmt.Println("Successfully migrated", issue.Key, "to", migrated.Key)
