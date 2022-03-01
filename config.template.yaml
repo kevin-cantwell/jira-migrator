@@ -1,16 +1,8 @@
-server:
-    host: "jira.etsycorp.com"
-    username: ""
-    password: ""
-    project_key: ""
-cloud:
-    host: "etsy.atlassian.net"
-    email: ""
-    api_key: ""
-    project_key: ""
-custom_fields:  
-    # ID: LABEL
-user_mappings:
-    "server name": "cloud name"
-status_mappings:
-    "server status": "cloud status"
+from:
+  host: "jira.etsycorp.com"
+  username: ""
+  password: ""
+to:
+  host: "etsy.atlassian.net"
+  username: ""
+  password: "" # may be an api key

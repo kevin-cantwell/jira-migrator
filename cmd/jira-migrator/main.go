@@ -17,7 +17,7 @@ import (
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
-	cliApp := &cli.App{
+	cliapp := &cli.App{
 		Name:  "jira-migrator",
 		Usage: "migrate tickets from one server to another",
 		Flags: []cli.Flag{
@@ -26,10 +26,6 @@ func main() {
 				Aliases: []string{"c"},
 				Value:   "config.yaml",
 				Usage:   "The configuration file to use.",
-			},
-			&cli.BoolFlag{
-				Name:  "dryrun",
-				Usage: "Run through all the migration steps without creating anything on the \"to\" server.",
 			},
 		},
 		Commands: []*cli.Command{
@@ -42,10 +38,30 @@ func main() {
 						Usage:    "The JQL query string to execute against the configured \"from\" server.",
 						Required: true,
 					},
+					&cli.BoolFlag{
+						Name:  "children",
+						Usage: "Set if you want to additionally want to migrate child issues.",
+					},
 				},
+				ArgsUsage: "PROJECT_KEY",
 				Action: func(c *cli.Context) error {
-					c.String("config")
-					app, err := NewApp(c.String("config"), c.Bool("dryrun"))
+					if c.NArg() == 0 {
+						return errors.New("must specify a project key")
+					}
+
+					configFile, err := os.Open(c.String("config"))
+					if err != nil {
+						return err
+					}
+
+					var config Config
+					if err := yaml.NewDecoder(configFile).Decode(&config); err != nil {
+						return err
+					}
+
+					projectKey := c.Args().First()
+
+					app, err := NewMigratorApp(projectKey, config)
 					if err != nil {
 						return errors.Wrap(err, "unable to configure app")
 					}
@@ -55,7 +71,6 @@ func main() {
 						return errors.Wrap(err, "unable to query issues")
 					}
 
-					// from.Key -> to.Key
 					progress := &Progress{
 						migrated: map[string]string{},
 						parents:  map[string]string{},
@@ -63,21 +78,16 @@ func main() {
 
 					// migrate issues in the order they were returned from the query
 					for _, issue := range issues {
-						if progress.IsMigrated(issue.Key) {
-							continue
+						if err := app.MigrateParents(&issue, progress); err != nil {
+							return errors.Wrap(err, "unable to migrate parents")
 						}
-						root, err := app.GetParentRoot(&issue)
-						if err != nil {
-							return errors.Wrap(err, "unable to walk parent heirarchy")
-						}
-						if progress.IsMigrated(root.Key) {
-							continue
-						}
-						if _, err := app.MigrateIssue(root, progress); err != nil {
+						if _, err := app.MigrateIssue(&issue, progress); err != nil {
 							return errors.Wrap(err, "unable to migrate issue")
 						}
-						if err := app.MigrateChildren(root, progress); err != nil {
-							return errors.Wrap(err, "unable to migrate children")
+						if c.Bool("children") {
+							if err := app.MigrateChildren(&issue, progress); err != nil {
+								return errors.Wrap(err, "unable to migrate children")
+							}
 						}
 					}
 					return nil
@@ -86,7 +96,7 @@ func main() {
 		},
 	}
 
-	err := cliApp.Run(os.Args)
+	err := cliapp.Run(os.Args)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -139,38 +149,26 @@ func (p *Progress) IsParentMigrated(from string) bool {
 
 type Config struct {
 	From struct {
-		Host       string `yaml:"host"`
-		Username   string `yaml:"username"`
-		Password   string `yaml:"password"`
-		ProjectKey string `yaml:"project_key"`
+		Host     string `yaml:"host"`
+		Username string `yaml:"username"`
+		Password string `yaml:"password"`
 	} `yaml:"from"`
 	To struct {
-		Host       string `yaml:"host"`
-		Username   string `yaml:"username"`
-		Password   string `yaml:"password"`
-		ProjectKey string `yaml:"project_key"`
+		Host     string `yaml:"host"`
+		Username string `yaml:"username"`
+		Password string `yaml:"password"`
 	} `yaml:"to"`
 }
 
-type App struct {
+type MigratorApp struct {
 	From       *jira.Client
 	To         *jira.Client
-	Config     Config
-	DryRun     bool
+	ProjectKey string
+	// Config     Config
 	UserLookup map[string]jira.User
 }
 
-func NewApp(pathToConfig string, dryrun bool) (*App, error) {
-	configFile, err := os.Open(pathToConfig)
-	if err != nil {
-		return nil, err
-	}
-
-	var config Config
-	if err := yaml.NewDecoder(configFile).Decode(&config); err != nil {
-		return nil, err
-	}
-
+func NewMigratorApp(projectKey string, config Config) (*MigratorApp, error) {
 	from, err := jira.NewClient((&jira.BasicAuthTransport{
 		Username: config.From.Username,
 		Password: config.From.Password,
@@ -187,7 +185,7 @@ func NewApp(pathToConfig string, dryrun bool) (*App, error) {
 		return nil, err
 	}
 
-	toUsers, err := getUsers(to, config.To.ProjectKey)
+	toUsers, err := getUsers(to, projectKey)
 	if err != nil {
 		return nil, err
 	}
@@ -197,16 +195,15 @@ func NewApp(pathToConfig string, dryrun bool) (*App, error) {
 		userLookup[user.EmailAddress] = user
 	}
 
-	return &App{
+	return &MigratorApp{
 		From:       from,
 		To:         to,
-		Config:     config,
-		DryRun:     dryrun,
+		ProjectKey: projectKey,
 		UserLookup: userLookup,
 	}, nil
 }
 
-func (app *App) QueryIssues(client *jira.Client, jql string) ([]jira.Issue, error) {
+func (app *MigratorApp) QueryIssues(client *jira.Client, jql string) ([]jira.Issue, error) {
 	var issues []jira.Issue
 	if err := client.Issue.SearchPages(jql, &jira.SearchOptions{
 		Expand: "names",
@@ -241,7 +238,7 @@ func (app *App) QueryIssues(client *jira.Client, jql string) ([]jira.Issue, erro
 	return issues, nil
 }
 
-func (app *App) MigrateChildren(parent *jira.Issue, progress *Progress) (err error) {
+func (app *MigratorApp) MigrateChildren(parent *jira.Issue, progress *Progress) (err error) {
 	var children []jira.Issue
 	// If its an epic, migrate its issues and any of thier children
 	if parent.Fields.Type.Name == "Epic" {
@@ -271,7 +268,7 @@ func (app *App) MigrateChildren(parent *jira.Issue, progress *Progress) (err err
 	return nil
 }
 
-func (app *App) GetParent(issue *jira.Issue) (*jira.Issue, error) {
+func (app *MigratorApp) GetParent(issue *jira.Issue) (*jira.Issue, error) {
 	var parentKey string
 	if parent := issue.Fields.Parent; parent != nil {
 		parentKey = parent.Key
@@ -295,24 +292,38 @@ func (app *App) GetParent(issue *jira.Issue) (*jira.Issue, error) {
 	return &parents[0], nil
 }
 
-func (app *App) GetParentRoot(issue *jira.Issue) (*jira.Issue, error) {
-	// If it's a subtask or has an epic, migrate its parent first.
+// func (app *MigratorApp) GetParentRoot(issue *jira.Issue) (*jira.Issue, error) {
+// 	// If it's a subtask or has an epic, migrate its parent first.
+// 	parent, err := app.GetParent(issue)
+// 	if err != nil {
+// 		errors.Wrap(err, "unable to get parent")
+// 	}
+// 	if parent != nil {
+// 		return app.GetParentRoot(parent)
+// 	}
+// 	return issue, nil
+// }
+
+// Migrates every parent up to root, but doesn't bother with siblings or cousins
+func (app *MigratorApp) MigrateParents(issue *jira.Issue, progress *Progress) error {
 	parent, err := app.GetParent(issue)
 	if err != nil {
 		errors.Wrap(err, "unable to get parent")
 	}
 	if parent != nil {
-		return app.GetParentRoot(parent)
+		if err := app.MigrateParents(parent, progress); err != nil {
+			return err
+		}
+		migratedParentKey, err := app.MigrateIssue(parent, progress)
+		if err != nil {
+			return err
+		}
+		progress.MarkMigratedParent(issue.Key, migratedParentKey)
 	}
-	return issue, nil
+	return nil
 }
 
-type MigrateOptions struct {
-	Parents  bool
-	Children bool
-}
-
-func (app *App) MigrateIssue(issue *jira.Issue, progress *Progress) (key string, err error) {
+func (app *MigratorApp) MigrateIssue(issue *jira.Issue, progress *Progress) (key string, err error) {
 	defer func() {
 		if err == nil {
 			progress.MarkMigrated(issue.Key, key)
@@ -326,20 +337,20 @@ func (app *App) MigrateIssue(issue *jira.Issue, progress *Progress) (key string,
 		return progress.MigratedKey(issue.Key), nil
 	}
 
-	// // First, check to see if this issue has already been migrated, and skip if so.
-	// migratedIssues, err := app.QueryIssues(app.To, `issue in issuesWithRemoteLinksByGlobalId("`+issue.Key+`") ORDER BY key DESC`)
-	// if err != nil {
-	// 	return "", err
-	// }
-	// if len(migratedIssues) > 0 {
-	// 	fmt.Println(issue.Key, "already migrated "+issue.Key+". Skipping.")
-	// 	return migratedIssues[0].Key, nil
-	// }
+	// First, check to see if this issue has already been migrated, and skip if so.
+	migratedIssues, err := app.QueryIssues(app.To, `issue in issuesWithRemoteLinksByGlobalId("`+issue.Key+`") ORDER BY key DESC`)
+	if err != nil {
+		return "", err
+	}
+	if len(migratedIssues) > 0 {
+		fmt.Println(issue.Key, "already migrated "+issue.Key+". Skipping.")
+		return migratedIssues[0].Key, nil
+	}
 
 	newIssue := jira.Issue{
 		Fields: &jira.IssueFields{
 			Project: jira.Project{
-				Key: app.Config.To.ProjectKey,
+				Key: app.ProjectKey,
 			},
 			Type: jira.IssueType{
 				Name: issue.Fields.Type.Name,
@@ -352,7 +363,7 @@ func (app *App) MigrateIssue(issue *jira.Issue, progress *Progress) (key string,
 		},
 	}
 
-	// This makes the transition from server to cloud appear better
+	// This makes the transition from server to cloud MigratorAppear better
 	if name := epicName(issue); name != "" {
 		newIssue.Fields.Summary = name
 		newIssue.Fields.Description = issue.Fields.Summary + "\n\n" + issue.Fields.Description
