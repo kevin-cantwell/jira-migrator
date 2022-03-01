@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -30,6 +31,75 @@ func main() {
 		},
 		Commands: []*cli.Command{
 			{
+				Name:  "inspect",
+				Usage: "Inspect issues",
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:  "host,h",
+						Usage: "The host to query. Valid values are \"from\" and \"to\"",
+						Value: "from",
+					},
+					&cli.StringFlag{
+						Name:     "jql",
+						Usage:    "The JQL query string to execute against the configured \"from\" server.",
+						Required: true,
+					},
+				},
+				Action: func(c *cli.Context) error {
+					configFile, err := os.Open(c.String("config"))
+					if err != nil {
+						return err
+					}
+
+					var config Config
+					if err := yaml.NewDecoder(configFile).Decode(&config); err != nil {
+						return err
+					}
+
+					from, err := jira.NewClient((&jira.BasicAuthTransport{
+						Username: config.From.Username,
+						Password: config.From.Password,
+					}).Client(), "https://"+config.From.Host)
+					if err != nil {
+						return err
+					}
+
+					to, err := jira.NewClient((&jira.BasicAuthTransport{
+						Username: config.To.Username,
+						Password: config.To.Password,
+					}).Client(), "https://"+config.To.Host)
+					if err != nil {
+						return err
+					}
+
+					var client *jira.Client
+					switch host := c.String("host"); host {
+					case "from":
+						client = from
+					case "to":
+						client = to
+					default:
+						return errors.New("invalid host value: " + host)
+					}
+
+					if err := client.Issue.SearchPages(c.String("jql"), &jira.SearchOptions{
+						Expand: "names",
+						Fields: SearchFields,
+					}, func(issue jira.Issue) error {
+						b, err := json.Marshal(issue)
+						if err != nil {
+							return err
+						}
+						fmt.Println(string(b))
+						return nil
+					}); err != nil {
+						return errors.Wrap(err, "unable to search pages")
+					}
+
+					return nil
+				},
+			},
+			{
 				Name:  "migrate",
 				Usage: "Migrate issues from one server to another",
 				Flags: []cli.Flag{
@@ -40,7 +110,7 @@ func main() {
 					},
 					&cli.BoolFlag{
 						Name:  "children",
-						Usage: "Set if you want to additionally want to migrate child issues.",
+						Usage: "Set if you want to migrate all child issues.",
 					},
 				},
 				ArgsUsage: "PROJECT_KEY",
@@ -203,32 +273,34 @@ func NewMigratorApp(projectKey string, config Config) (*MigratorApp, error) {
 	}, nil
 }
 
+var SearchFields = []string{
+	"project",
+	"summary",
+	"status",
+	"description",
+	"created",
+	"creator",
+	"updated",
+	"resolutiondate",
+	"issuelinks",
+	"issuetype",
+	"labels",
+	"assignee",
+	"reporter",
+	"comment",
+	"attachment",
+	"priority",
+	"parent",
+	"subtasks",
+	"customfield_10620", // epic key
+	"customfield_10621", // epic name
+}
+
 func (app *MigratorApp) QueryIssues(client *jira.Client, jql string) ([]jira.Issue, error) {
 	var issues []jira.Issue
 	if err := client.Issue.SearchPages(jql, &jira.SearchOptions{
 		Expand: "names",
-		Fields: []string{
-			"project",
-			"summary",
-			"status",
-			"description",
-			"created",
-			"creator",
-			"updated",
-			"resolutiondate",
-			"issuelinks",
-			"issuetype",
-			"labels",
-			"assignee",
-			"reporter",
-			"comment",
-			"attachment",
-			"priority",
-			"parent",
-			"subtasks",
-			"customfield_10620", // epic key
-			"customfield_10621", // epic name
-		},
+		Fields: SearchFields,
 	}, func(issue jira.Issue) error {
 		issues = append(issues, issue)
 		return nil
