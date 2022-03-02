@@ -15,11 +15,23 @@ A hacky tool for migrating issues from Jira Server to Jira Cloud.
 
 #### Known issues
 * Priority does not migrate: https://github.com/kevin-cantwell/jira-migrator/issues/1
+* This tool uses Jira's v2 REST api, which may not work as expected against some servers.
 
 # Installation
 You can grab a binary from the [releases page](https://github.com/kevin-cantwell/jira-migrator/releases).
 
 # Usage
+Create a file called `config.yaml` in your working directory that looks like this:
+```yaml
+server:
+  host: "jira.etsycorp.com" # Or whatever source host has issues you wish to migrate
+  username: "" # your LDAP
+  password: "" # your typical login password
+cloud:
+  host: "etsy.atlassian.net" # Or whatever target host you want to migrate to.
+  username: "" # your work email
+  password: "" # use an api key that you generate from your Jira account
+```
 
 ### Inspecting issues
 This command is read-only and can do no harm.
