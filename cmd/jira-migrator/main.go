@@ -144,34 +144,41 @@ func main() {
 					&cli.IntFlag{
 						Name:  "rate-limit",
 						Usage: "Set the api rate limit (per 5 minutes) to respect.",
-						Value: 500,
+						Value: 7,
 					},
 				},
 				ArgsUsage: "PROJECT_KEY",
 				Action: func(c *cli.Context) error {
 					var (
-						config     Config
+						config     = c.String("config")
+						jql        = c.String("jql")
+						children   = c.Bool("children")
+						rateLimit  = c.Int("rate-limit")
 						projectKey = c.Args().First()
-						errg       errgroup.Group
 						issues     = make(chan jira.Issue)
+
+						errg errgroup.Group
+						cfg  Config
 					)
 
 					if c.NArg() == 0 {
 						return errors.New("must specify a project key")
 					}
 
-					configFile, err := os.Open(c.String("config"))
+					configFile, err := os.Open(config)
 					if err != nil {
 						return err
 					}
 
-					if err := yaml.NewDecoder(configFile).Decode(&config); err != nil {
+					if err := yaml.NewDecoder(configFile).Decode(&cfg); err != nil {
 						return err
 					}
 
-					config.ProjectKey = projectKey
+					// override configs
+					cfg.ProjectKey = projectKey
+					cfg.RateLimit = rateLimit
 
-					app, err := NewMigratorApp(config)
+					app, err := NewMigratorApp(cfg)
 					if err != nil {
 						return errors.Wrap(err, "unable to configure app")
 					}
@@ -179,7 +186,7 @@ func main() {
 					errg.Go(func() error {
 						defer close(issues)
 
-						if err := app.Server.Issue.SearchPages(c.String("jql"), &jira.SearchOptions{
+						if err := app.Server.Issue.SearchPages(jql, &jira.SearchOptions{
 							Expand: "names",
 							Fields: DefaultSearchFields,
 						}, func(issue jira.Issue) error {
@@ -201,7 +208,7 @@ func main() {
 							if _, err := app.MigrateIssue(&issue); err != nil {
 								return errors.Wrap(err, "unable to migrate issue")
 							}
-							if c.Bool("children") {
+							if children {
 								if err := app.MigrateChildren(&issue); err != nil {
 									return errors.Wrap(err, "unable to migrate children")
 								}
@@ -310,8 +317,8 @@ type Config struct {
 		Username string `yaml:"username"`
 		Password string `yaml:"password"`
 	} `yaml:"cloud"`
-	ProjectKey string `yaml:"project_key"`
-	RateLimit  int    `yaml:"rate_limit"`
+	ProjectKey string
+	RateLimit  int
 }
 
 type BackoffTransport struct {
