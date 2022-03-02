@@ -143,7 +143,7 @@ func main() {
 					},
 					&cli.IntFlag{
 						Name:  "rate-limit",
-						Usage: "Set the api rate limit (per 5 minutes) to respect.",
+						Usage: "Set the api rate limit (max requests per second) to respect.",
 						Value: 7,
 					},
 				},

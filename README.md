@@ -29,8 +29,8 @@ USAGE:
    jira-migrator inspect [command options] [arguments...]
 
 OPTIONS:
-   --host value  The host to query. Valid values are "from" and "to" (default: "from")
-   --jql value   The JQL query string to execute against the configured "from" server.
+   --host value  The host to query. Valid values are "server" and "cloud" (default: "server")
+   --jql value   The JQL query string to execute against the configured "server" server.
    --help, -h    show help (default: false)
 ```
 
@@ -38,13 +38,14 @@ OPTIONS:
 This command will create issues in the target server's project.
 ```
 NAME:
-   jira-migrator migrate - Migrate issues from one server to another
+   jira-migrator migrate - Migrate issues server one server to another
 
 USAGE:
    jira-migrator migrate [command options] PROJECT_KEY
 
 OPTIONS:
-   --jql value  The JQL query string to execute against the configured "from" server.
-   --children   Set if you want to migrate all child issues. (default: false)
-   --help, -h   show help (default: false)
+   --jql value         The JQL query string to execute against the configured "server" server.
+   --children          Set if you want to migrate all child issues. (default: false)
+   --rate-limit value  Set the api rate limit (max requests per second) to respect. (default: 7)
+   --help, -h          show help (default: false)
 ```
