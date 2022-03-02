@@ -1,8 +1,8 @@
-from:
+server:
   host: "jira.etsycorp.com"
   username: ""
   password: ""
-to:
+cloud:
   host: "etsy.atlassian.net"
   username: ""
   password: "" # may be an api key

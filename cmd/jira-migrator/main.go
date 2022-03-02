@@ -1,13 +1,13 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
+	"net/http/httputil"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -21,12 +21,35 @@ import (
 	yaml "gopkg.in/yaml.v2"
 )
 
+var DefaultSearchFields = []string{
+	"project",
+	"summary",
+	"status",
+	"description",
+	"created",
+	"creator",
+	"updated",
+	"resolutiondate",
+	"issuelinks",
+	"issuetype",
+	"labels",
+	"assignee",
+	"reporter",
+	"comment",
+	"attachment",
+	"priority",
+	"parent",
+	"subtasks",
+	"customfield_10620", // epic key
+	"customfield_10621", // epic name
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
 	cliapp := &cli.App{
 		Name:  "jira-migrator",
-		Usage: "migrate tickets from one server to another",
+		Usage: "migrate tickets server one server to another",
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:    "config",
@@ -42,12 +65,12 @@ func main() {
 				Flags: []cli.Flag{
 					&cli.StringFlag{
 						Name:  "host,h",
-						Usage: "The host to query. Valid values are \"from\" and \"to\"",
-						Value: "from",
+						Usage: "The host to query. Valid values are \"server\" and \"cloud\"",
+						Value: "server",
 					},
 					&cli.StringFlag{
 						Name:     "jql",
-						Usage:    "The JQL query string to execute against the configured \"from\" server.",
+						Usage:    "The JQL query string to execute against the configured \"server\" server.",
 						Required: true,
 					},
 				},
@@ -62,27 +85,27 @@ func main() {
 						return err
 					}
 
-					from, err := jira.NewClient((&jira.BasicAuthTransport{
-						Username: config.From.Username,
-						Password: config.From.Password,
-					}).Client(), "https://"+config.From.Host)
+					server, err := jira.NewClient((&jira.BasicAuthTransport{
+						Username: config.Server.Username,
+						Password: config.Server.Password,
+					}).Client(), "https://"+config.Server.Host)
 					if err != nil {
 						return err
 					}
 
 					to, err := jira.NewClient((&jira.BasicAuthTransport{
-						Username: config.To.Username,
-						Password: config.To.Password,
-					}).Client(), "https://"+config.To.Host)
+						Username: config.Cloud.Username,
+						Password: config.Cloud.Password,
+					}).Client(), "https://"+config.Cloud.Host)
 					if err != nil {
 						return err
 					}
 
 					var client *jira.Client
 					switch host := c.String("host"); host {
-					case "from":
-						client = from
-					case "to":
+					case "server":
+						client = server
+					case "cloud":
 						client = to
 					default:
 						return errors.New("invalid host value: " + host)
@@ -107,16 +130,21 @@ func main() {
 			},
 			{
 				Name:  "migrate",
-				Usage: "Migrate issues from one server to another",
+				Usage: "Migrate issues server one server to another",
 				Flags: []cli.Flag{
 					&cli.StringFlag{
 						Name:     "jql",
-						Usage:    "The JQL query string to execute against the configured \"from\" server.",
+						Usage:    "The JQL query string to execute against the configured \"server\" server.",
 						Required: true,
 					},
 					&cli.BoolFlag{
 						Name:  "children",
 						Usage: "Set if you want to migrate all child issues.",
+					},
+					&cli.IntFlag{
+						Name:  "rate-limit",
+						Usage: "Set the api rate limit (per 5 minutes) to respect.",
+						Value: 500,
 					},
 				},
 				ArgsUsage: "PROJECT_KEY",
@@ -141,7 +169,9 @@ func main() {
 						return err
 					}
 
-					app, err := NewMigratorApp(projectKey, config)
+					config.ProjectKey = projectKey
+
+					app, err := NewMigratorApp(config)
 					if err != nil {
 						return errors.Wrap(err, "unable to configure app")
 					}
@@ -149,7 +179,7 @@ func main() {
 					errg.Go(func() error {
 						defer close(issues)
 
-						if err := app.From.Issue.SearchPages(c.String("jql"), &jira.SearchOptions{
+						if err := app.Server.Issue.SearchPages(c.String("jql"), &jira.SearchOptions{
 							Expand: "names",
 							Fields: DefaultSearchFields,
 						}, func(issue jira.Issue) error {
@@ -195,18 +225,7 @@ func main() {
 }
 
 func respErrExit(resp *jira.Response, err error) {
-	dumpResponse(resp)
 	panic(err)
-}
-
-func dumpResponse(resp *jira.Response) {
-	if resp != nil {
-		fmt.Println("X-Ratelimit-Limit:", resp.Header.Get("X-Ratelimit-Limit"))
-		fmt.Println("X-Ratelimit-Remaining:", resp.Header.Get("X-Ratelimit-Remaining"))
-		fmt.Println("X-Ratelimit-Reset:", resp.Header.Get("X-Ratelimit-Reset"))
-		io.Copy(os.Stderr, resp.Body)
-		fmt.Fprint(os.Stderr, "\n")
-	}
 }
 
 type ErrorResponse struct {
@@ -230,97 +249,174 @@ type Progress struct {
 	parents   map[string]string
 }
 
-func (p *Progress) MarkMigrating(from string) {
+func (p *Progress) MarkMigrating(server string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.migrating[from] = true
+	p.migrating[server] = true
 }
 
-func (p *Progress) IsMigrating(from string) bool {
+func (p *Progress) IsMigrating(server string) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.migrating[from]
+	return p.migrating[server]
 }
 
-func (p *Progress) MarkMigrated(from, to string) {
+func (p *Progress) MarkMigrated(server, to string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.migrated[from] = to
+	p.migrated[server] = to
 }
 
-func (p *Progress) MarkMigratedParent(from, toParent string) {
+func (p *Progress) MarkMigratedParent(server, toParent string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.parents[from] = toParent
+	p.parents[server] = toParent
 }
 
-func (p *Progress) MigratedKey(from string) string {
+func (p *Progress) MigratedKey(server string) string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.migrated[from]
+	return p.migrated[server]
 }
 
-func (p *Progress) MigratedParentKey(from string) string {
+func (p *Progress) MigratedParentKey(server string) string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.parents[from]
+	return p.parents[server]
 }
 
-func (p *Progress) IsMigrated(from string) bool {
+func (p *Progress) IsMigrated(server string) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	_, ok := p.migrated[from]
+	_, ok := p.migrated[server]
 	return ok
 }
 
-func (p *Progress) IsParentMigrated(from string) bool {
+func (p *Progress) IsParentMigrated(server string) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	_, ok := p.parents[from]
+	_, ok := p.parents[server]
 	return ok
 }
 
 type Config struct {
-	From struct {
+	Server struct {
 		Host     string `yaml:"host"`
 		Username string `yaml:"username"`
 		Password string `yaml:"password"`
-	} `yaml:"from"`
-	To struct {
+	} `yaml:"server"`
+	Cloud struct {
 		Host     string `yaml:"host"`
 		Username string `yaml:"username"`
 		Password string `yaml:"password"`
-	} `yaml:"to"`
+	} `yaml:"cloud"`
+	ProjectKey string `yaml:"project_key"`
+	RateLimit  int    `yaml:"rate_limit"`
+}
+
+type BackoffTransport struct {
+	limiter *rate.Limiter
+}
+
+func (tr *BackoffTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return tr.roundTrip(10*time.Second, req)
+}
+
+func (tr *BackoffTransport) roundTrip(backoff time.Duration, req *http.Request) (*http.Response, error) {
+	if err := tr.limiter.Wait(req.Context()); err != nil {
+		return nil, err
+	}
+
+	resp, err := http.DefaultTransport.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+
+	switch resp.StatusCode {
+	case http.StatusTooManyRequests:
+		if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
+			log.Println(req.URL.Host, req.Method, req.URL.Path, http.StatusText(resp.StatusCode), "Backing off for", backoff)
+			secs, err := strconv.ParseInt(retryAfter, 10, 64)
+			if err != nil {
+				panic(err)
+			}
+			select {
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			case <-time.After(time.Duration(secs) * time.Second):
+				return tr.RoundTrip(req)
+			}
+		}
+		if reset := resp.Header.Get("X-RateLimit-Reset"); reset != "" {
+			log.Println(req.URL.Host, req.Method, req.URL.Path, http.StatusText(resp.StatusCode), "Backing off for", backoff)
+			// yyyy-MM-ddTHH:mmZ
+			t, err := time.Parse("2006-01-02T15:04Z", reset)
+			if err != nil {
+				panic(err)
+			}
+			select {
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			case <-time.After(time.Until(t)):
+				return tr.RoundTrip(req)
+			}
+		}
+	default:
+		if resp.StatusCode >= 400 {
+			reqDump, _ := httputil.DumpRequest(req, true)
+			respDump, _ := httputil.DumpResponse(resp, true)
+			fmt.Println(string(reqDump) + string(respDump))
+
+			log.Println(req.URL.Host, req.Method, req.URL.Path, http.StatusText(resp.StatusCode), "Backing off for", backoff)
+			select {
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			case <-time.After(backoff):
+				// exponential backoff
+				return tr.roundTrip(backoff*2, req)
+			}
+		}
+	}
+
+	return resp, nil
 }
 
 type MigratorApp struct {
-	From       *jira.Client
-	To         *jira.Client
+	Server     *jira.Client
+	Cloud      *jira.Client
 	ProjectKey string
-	// Config     Config
 	UserLookup map[string]jira.User
 	Progress   *Progress
-	ApiLimiter *rate.Limiter
+
+	// Ensures that we only migrate each issue once without having to implement fancy
+	// deduplication logic for this unit of work
+	migrateGroup singleflight.Group
 }
 
-func NewMigratorApp(projectKey string, config Config) (*MigratorApp, error) {
-	from, err := jira.NewClient((&jira.BasicAuthTransport{
-		Username: config.From.Username,
-		Password: config.From.Password,
-	}).Client(), "https://"+config.From.Host)
+func NewMigratorApp(config Config) (*MigratorApp, error) {
+	server, err := jira.NewClient((&jira.BasicAuthTransport{
+		Username: config.Server.Username,
+		Password: config.Server.Password,
+		Transport: &BackoffTransport{
+			limiter: rate.NewLimiter(rate.Limit(float64(config.RateLimit)), config.RateLimit), // N round trips per second
+		},
+	}).Client(), "https://"+config.Server.Host)
 	if err != nil {
 		return nil, err
 	}
 
-	to, err := jira.NewClient((&jira.BasicAuthTransport{
-		Username: config.To.Username,
-		Password: config.To.Password,
-	}).Client(), "https://"+config.To.Host)
+	cloud, err := jira.NewClient((&jira.BasicAuthTransport{
+		Username: config.Cloud.Username,
+		Password: config.Cloud.Password,
+		Transport: &BackoffTransport{
+			limiter: rate.NewLimiter(rate.Limit(float64(config.RateLimit)), config.RateLimit), // N round trips per second
+		},
+	}).Client(), "https://"+config.Cloud.Host)
 	if err != nil {
 		return nil, err
 	}
 
-	toUsers, err := getUsers(to, projectKey)
+	toUsers, err := getUsers(cloud, config.ProjectKey)
 	if err != nil {
 		return nil, err
 	}
@@ -331,36 +427,12 @@ func NewMigratorApp(projectKey string, config Config) (*MigratorApp, error) {
 	}
 
 	return &MigratorApp{
-		From:       from,
-		To:         to,
-		ProjectKey: projectKey,
+		Server:     server,
+		Cloud:      cloud,
+		ProjectKey: config.ProjectKey,
 		UserLookup: userLookup,
 		Progress:   NewProgress(),
-		ApiLimiter: rate.NewLimiter(rate.Limit(100*time.Millisecond), 2),
 	}, nil
-}
-
-var DefaultSearchFields = []string{
-	"project",
-	"summary",
-	"status",
-	"description",
-	"created",
-	"creator",
-	"updated",
-	"resolutiondate",
-	"issuelinks",
-	"issuetype",
-	"labels",
-	"assignee",
-	"reporter",
-	"comment",
-	"attachment",
-	"priority",
-	"parent",
-	"subtasks",
-	"customfield_10620", // epic key
-	"customfield_10621", // epic name
 }
 
 func (app *MigratorApp) QueryIssues(client *jira.Client, jql string, fields ...string) ([]jira.Issue, error) {
@@ -382,13 +454,13 @@ func (app *MigratorApp) MigrateChildren(parent *jira.Issue) (err error) {
 	var children []jira.Issue
 	// If its an epic, migrate its issues and any of thier children
 	if parent.Fields.Type.Name == "Epic" {
-		children, err = app.QueryIssues(app.From, `"Epic Link" = `+parent.Key+` ORDER BY key`)
+		children, err = app.QueryIssues(app.Server, `"Epic Link" = `+parent.Key+` ORDER BY key`)
 		if err != nil {
 			return errors.Wrap(err, "unable to query epic children")
 		}
 	}
 	if len(parent.Fields.Subtasks) > 0 {
-		children, err = app.QueryIssues(app.From, `parent in ("`+parent.Key+`") ORDER BY key`)
+		children, err = app.QueryIssues(app.Server, `parent in ("`+parent.Key+`") ORDER BY key`)
 		if err != nil {
 			return errors.Wrap(err, "unable to query subtasks")
 		}
@@ -430,7 +502,7 @@ func (app *MigratorApp) GetParent(issue *jira.Issue) (*jira.Issue, error) {
 		return nil, nil
 	}
 
-	parents, err := app.QueryIssues(app.From, `issue = `+parentKey)
+	parents, err := app.QueryIssues(app.Server, `issue = `+parentKey)
 	if err != nil {
 		return nil, err
 	}
@@ -473,14 +545,8 @@ func (app *MigratorApp) MigrateParents(issue *jira.Issue) error {
 	return nil
 }
 
-// Ensures that we only migrate each issue once without having to implement fancy
-// deduplication logic for this unit of work
-var migrateIssueGroup singleflight.Group
-
 func (app *MigratorApp) MigrateIssue(issue *jira.Issue) (string, error) {
-	app.ApiLimiter.Wait(context.Background())
-
-	key, err, _ := migrateIssueGroup.Do(issue.Key, func() (interface{}, error) {
+	key, err, _ := app.migrateGroup.Do(issue.Key, func() (interface{}, error) {
 		return app.migrateIssue(issue)
 	})
 	return key.(string), err
@@ -496,7 +562,7 @@ func (app *MigratorApp) migrateIssue(issue *jira.Issue) (key string, err error) 
 	fmt.Println("Migrating", issue.Key, "...")
 
 	// First, check to see if this issue has already been migrated, and skip if so.
-	migratedIssues, err := app.QueryIssues(app.To, `issue in issuesWithRemoteLinksByGlobalId("`+issue.Key+`") ORDER BY key DESC`)
+	migratedIssues, err := app.QueryIssues(app.Cloud, `issue in issuesWithRemoteLinksByGlobalId("`+issue.Key+`") ORDER BY key DESC`)
 	if err != nil {
 		return "", err
 	}
@@ -516,12 +582,12 @@ func (app *MigratorApp) migrateIssue(issue *jira.Issue) (key string, err error) 
 			Summary:     issue.Fields.Summary,
 			Description: issue.Fields.Description,
 			// TODO: Match priorities
-			Priority: issue.Fields.Priority,
-			Labels:   issue.Fields.Labels,
+			// Priority: issue.Fields.Priority,
+			Labels: issue.Fields.Labels,
 		},
 	}
 
-	// This makes the transition from server to cloud MigratorAppear better
+	// This makes the transition server server to cloud MigratorAppear better
 	if name := epicName(issue); name != "" {
 		newIssue.Fields.Summary = name
 		newIssue.Fields.Description = issue.Fields.Summary + "\n\n" + issue.Fields.Description
@@ -553,16 +619,17 @@ func (app *MigratorApp) migrateIssue(issue *jira.Issue) (key string, err error) 
 		}
 	}
 
-	migrated, resp, err := app.To.Issue.Create(&newIssue)
+	migrated, _, err := app.Cloud.Issue.Create(&newIssue)
 	if err != nil {
-		dumpResponse(resp)
+		b, _ := json.Marshal(newIssue)
+		panic(string(b))
 		return "", errors.Wrap(err, "Error creating issue")
 	}
 
 	errg := errgroup.Group{}
 
 	errg.Go(func() error {
-		if _, resp, err := app.To.Issue.AddRemoteLink(migrated.ID, &jira.RemoteLink{
+		if _, _, err := app.Cloud.Issue.AddRemoteLink(migrated.ID, &jira.RemoteLink{
 			GlobalID: issue.Key,
 			Application: &jira.RemoteLinkApplication{
 				Type: "jira.etsycorp.com",
@@ -574,7 +641,6 @@ func (app *MigratorApp) migrateIssue(issue *jira.Issue) (key string, err error) 
 				Summary: issue.Fields.Summary,
 			},
 		}); err != nil {
-			dumpResponse(resp)
 			return errors.Wrap(err, "Error creating remote link")
 		}
 		return nil
@@ -584,14 +650,13 @@ func (app *MigratorApp) migrateIssue(issue *jira.Issue) (key string, err error) 
 		// Comments can't be set on create. They must be added later
 		if issue.Fields.Comments != nil {
 			for _, comment := range issue.Fields.Comments.Comments {
-				if _, resp, err := app.To.Issue.AddComment(migrated.ID, &jira.Comment{
+				if _, _, err := app.Cloud.Issue.AddComment(migrated.ID, &jira.Comment{
 					Name: comment.Name,
 					// It's impossible to set a different author than "self",
 					// so just indicate who wrote this originally in the body of the comment.
 					Body:       "On " + comment.Created + " " + comment.Author.EmailAddress + " wrote:\n\n" + comment.Body,
 					Visibility: comment.Visibility,
 				}); err != nil {
-					dumpResponse(resp)
 					return errors.Wrapf(err, "Error adding comment to %s", migrated.Key)
 				}
 			}
@@ -603,14 +668,12 @@ func (app *MigratorApp) migrateIssue(issue *jira.Issue) (key string, err error) 
 		// Attachments can't be set on create, they must be downloaded and posted later
 		for _, attachment := range issue.Fields.Attachments {
 			req, _ := http.NewRequest("GET", attachment.Content, nil)
-			resp, err := app.From.Do(req, nil)
+			resp, err := app.Server.Do(req, nil)
 			if err != nil {
-				dumpResponse(resp)
-				return errors.Wrapf(err, "Error fetching attachment %q from issue %s", attachment.Filename, issue.Key)
+				return errors.Wrapf(err, "Error fetching attachment %q server issue %s", attachment.Filename, issue.Key)
 			}
 			defer resp.Body.Close()
-			if _, resp, err := app.To.Issue.PostAttachment(migrated.ID, resp.Body, attachment.Filename); err != nil {
-				dumpResponse(resp)
+			if _, _, err := app.Cloud.Issue.PostAttachment(migrated.ID, resp.Body, attachment.Filename); err != nil {
 				return errors.Wrapf(err, "Error posting attachment %q to issue %s", attachment.Filename, migrated.Key)
 			}
 		}
@@ -619,15 +682,13 @@ func (app *MigratorApp) migrateIssue(issue *jira.Issue) (key string, err error) 
 
 	errg.Go(func() error {
 		// Transition the ticket to the correct status
-		transitions, resp, err := app.To.Issue.GetTransitions(migrated.ID)
+		transitions, _, err := app.Cloud.Issue.GetTransitions(migrated.ID)
 		if err != nil {
-			dumpResponse(resp)
 			return errors.Wrapf(err, "Error fetching transitions for %s", migrated.Key)
 		}
 		for _, transition := range transitions {
 			if transition.To.Name == issue.Fields.Status.Name {
-				if resp, err := app.To.Issue.DoTransition(migrated.ID, transition.ID); err != nil {
-					dumpResponse(resp)
+				if _, err := app.Cloud.Issue.DoTransition(migrated.ID, transition.ID); err != nil {
 					return errors.Wrapf(err, "Error transitioning issue %s to %q", migrated.Key, transition.To.Name)
 				}
 			}
@@ -673,11 +734,11 @@ func getUsers(cloud *jira.Client, projectKey string) ([]jira.User, error) {
 	for role, resource := range project.Roles {
 		req, err := http.NewRequest("GET", resource, nil)
 		if err != nil {
-			return nil, errors.Wrapf(err, "Error retrieving %s role from %s", role, resource)
+			return nil, errors.Wrapf(err, "Error retrieving %s role server %s", role, resource)
 		}
 		var role jira.Role
 		if _, err := cloud.Do(req, &role); err != nil {
-			return nil, errors.Wrapf(err, "Error retrieving %s role from %s", role, resource)
+			return nil, errors.Wrapf(err, "Error retrieving %s role server %s", role, resource)
 		}
 		for _, actor := range role.Actors {
 			user, _, err := cloud.User.GetByAccountID(actor.ActorUser.AccountID)
