@@ -147,7 +147,7 @@ func main() {
 						Value: 7,
 					},
 				},
-				ArgsUsage: "PROJECT_KEY",
+				ArgsUsage: "DESTINATION_PROJECT_KEY",
 				Action: func(c *cli.Context) error {
 					var (
 						config     = c.String("config")

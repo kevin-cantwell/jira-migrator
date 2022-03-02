@@ -61,7 +61,7 @@ NAME:
    jira-migrator migrate - Migrate issues server one server to another
 
 USAGE:
-   jira-migrator migrate [command options] PROJECT_KEY
+   jira-migrator migrate [command options] DESTINATION_PROJECT_KEY
 
 OPTIONS:
    --jql value         The JQL query string to execute against the configured "server" server.
