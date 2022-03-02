@@ -3,6 +3,7 @@ A hacky tool for migrating issues from Jira Server to Jira Cloud.
 
 #### Features
 * You select the issues you wish to migrate by specifying a JQL statement.
+* Migrates all comments and attachments.
 * It will migrate issues concurrently. It's so fast it can overload the server, so a rate limit option can be set. The default is 7 api requests per server per second (about 2-3 issues per second), which seems to be about the upper bound before you start to see exponential backoffs.
 * It is somwewhat idempodent in that it can be re-run without creating dupes. However, if the tool fails in the middle of a migration, migrated issues may be incomplete.
 * You may optionally migrate child issues.
