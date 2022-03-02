@@ -15,7 +15,9 @@ A hacky tool for migrating issues from Jira Server to Jira Cloud.
 
 #### Known issues
 * Priority does not migrate: https://github.com/kevin-cantwell/jira-migrator/issues/1
-* 
+
+# Installation
+You can grab a binary from the [releases page](https://github.com/kevin-cantwell/jira-migrator/releases).
 
 # Usage
 
@@ -37,9 +39,10 @@ OPTIONS:
 
 ### Migrating issues
 You'll need to do some prep on your target project before migrating:
-1. Ensure that every issue's type you're migrating has a corresponding issue with the _exact same name_ in the target project.
-2. Ensure that every issue's status you're migrating has a corresponding status with the _exact same name_ in the target project.
-3. For best results, 
+1. Ensure that, for every issue you're migrating, its type has a corresponding issue with the _*exact same name*_ in the cloud project.
+2. Ensure that, for every issue you're migrating, its status has a corresponding status with the _*exact same name*_ in the cloud project.
+3. For best results, add as many users that appear in the issues you're migrating as members of your cloud project as well. The tool will make a best effort to match them by email address. Any misses will be replaced by your cloud user.
+4. TURN OFF ALL NOTIFICATIONS for each user in the cloud project before migrating. Your project members will thank you.
 
 ```
 NAME:
