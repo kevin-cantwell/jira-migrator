@@ -653,27 +653,29 @@ func (app *MigratorApp) migrateIssue(issue *jira.Issue) (key string, err error) 
 		return nil
 	})
 
-	errg.Go(func() error {
-		// Comments can't be set on create. They must be added later
-		if issue.Fields.Comments != nil {
+	// Comments can't be set on create. They must be added later
+	if issue.Fields.Comments != nil {
+		errg.Go(func() error {
 			for _, comment := range issue.Fields.Comments.Comments {
+				comment := comment
 				if _, _, err := app.Cloud.Issue.AddComment(migrated.ID, &jira.Comment{
 					Name: comment.Name,
 					// It's impossible to set a different author than "self",
 					// so just indicate who wrote this originally in the body of the comment.
-					Body:       "On " + comment.Created + " " + comment.Author.EmailAddress + " wrote:\n\n" + comment.Body,
+					Body:       "On " + comment.Created + " " + comment.Author.Name + " wrote:\n\n" + comment.Body,
 					Visibility: comment.Visibility,
 				}); err != nil {
 					return errors.Wrapf(err, "Error adding comment to %s", migrated.Key)
 				}
 			}
-		}
-		return nil
-	})
+			return nil
+		})
+	}
 
-	errg.Go(func() error {
-		// Attachments can't be set on create, they must be downloaded and posted later
-		for _, attachment := range issue.Fields.Attachments {
+	// Attachments can't be set on create, they must be downloaded and posted later
+	for _, attachment := range issue.Fields.Attachments {
+		attachment := attachment
+		errg.Go(func() error {
 			req, _ := http.NewRequest("GET", attachment.Content, nil)
 			resp, err := app.Server.Do(req, nil)
 			if err != nil {
@@ -683,9 +685,9 @@ func (app *MigratorApp) migrateIssue(issue *jira.Issue) (key string, err error) 
 			if _, _, err := app.Cloud.Issue.PostAttachment(migrated.ID, resp.Body, attachment.Filename); err != nil {
 				return errors.Wrapf(err, "Error posting attachment %q to issue %s", attachment.Filename, migrated.Key)
 			}
-		}
-		return nil
-	})
+			return nil
+		})
+	}
 
 	errg.Go(func() error {
 		// Transition the ticket to the correct status
