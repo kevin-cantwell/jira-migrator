@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -155,7 +156,6 @@ func main() {
 						children   = c.Bool("children")
 						rateLimit  = c.Int("rate-limit")
 						projectKey = c.Args().First()
-						issues     = make(chan jira.Issue)
 
 						errg errgroup.Group
 						cfg  Config
@@ -183,38 +183,35 @@ func main() {
 						return errors.Wrap(err, "unable to configure app")
 					}
 
-					errg.Go(func() error {
-						defer close(issues)
+					ctx, cancel := context.WithCancel(context.Background())
 
-						if err := app.Server.Issue.SearchPages(jql, &jira.SearchOptions{
-							Expand: "names",
-							Fields: DefaultSearchFields,
-						}, func(issue jira.Issue) error {
-							issues <- issue
-							return nil
-						}); err != nil {
-							return errors.Wrap(err, "unable to search pages")
-						}
-						return nil
-					})
+					if err := app.Server.Issue.SearchPagesWithContext(ctx, jql, &jira.SearchOptions{
+						Expand: "names",
+						Fields: DefaultSearchFields,
+					}, func(issue jira.Issue) error {
+						errg.Go(func() (err error) {
+							defer func() {
+								if err != nil {
+									cancel()
+								}
+							}()
 
-					for issue := range issues {
-						issue := issue // avoid loop closure captures
-
-						errg.Go(func() error {
-							if err := app.MigrateParents(&issue); err != nil {
+							if err := app.MigrateParents(ctx, &issue); err != nil {
 								return errors.Wrap(err, "unable to migrate parents")
 							}
-							if _, err := app.MigrateIssue(&issue); err != nil {
+							if _, err = app.MigrateIssue(ctx, &issue); err != nil {
 								return errors.Wrap(err, "unable to migrate issue")
 							}
 							if children {
-								if err := app.MigrateChildren(&issue); err != nil {
+								if err := app.MigrateChildren(ctx, &issue); err != nil {
 									return errors.Wrap(err, "unable to migrate children")
 								}
 							}
 							return nil
 						})
+						return nil
+					}); err != nil {
+						return errors.Wrap(err, "unable to search pages")
 					}
 
 					return errg.Wait()
@@ -442,9 +439,9 @@ func NewMigratorApp(config Config) (*MigratorApp, error) {
 	}, nil
 }
 
-func (app *MigratorApp) QueryIssues(client *jira.Client, jql string, fields ...string) ([]jira.Issue, error) {
+func (app *MigratorApp) QueryIssues(ctx context.Context, client *jira.Client, jql string, fields ...string) ([]jira.Issue, error) {
 	var issues []jira.Issue
-	if err := client.Issue.SearchPages(jql, &jira.SearchOptions{
+	if err := client.Issue.SearchPagesWithContext(ctx, jql, &jira.SearchOptions{
 		Expand: "names",
 		Fields: DefaultSearchFields,
 	}, func(issue jira.Issue) error {
@@ -457,17 +454,17 @@ func (app *MigratorApp) QueryIssues(client *jira.Client, jql string, fields ...s
 }
 
 // Safe for concurrent use.
-func (app *MigratorApp) MigrateChildren(parent *jira.Issue) (err error) {
+func (app *MigratorApp) MigrateChildren(ctx context.Context, parent *jira.Issue) (err error) {
 	var children []jira.Issue
 	// If its an epic, migrate its issues and any of thier children
 	if parent.Fields.Type.Name == "Epic" {
-		children, err = app.QueryIssues(app.Server, `"Epic Link" = `+parent.Key+` ORDER BY key`)
+		children, err = app.QueryIssues(ctx, app.Server, `"Epic Link" = `+parent.Key+` ORDER BY key`)
 		if err != nil {
 			return errors.Wrap(err, "unable to query epic children")
 		}
 	}
 	if len(parent.Fields.Subtasks) > 0 {
-		children, err = app.QueryIssues(app.Server, `parent in ("`+parent.Key+`") ORDER BY key`)
+		children, err = app.QueryIssues(ctx, app.Server, `parent in ("`+parent.Key+`") ORDER BY key`)
 		if err != nil {
 			return errors.Wrap(err, "unable to query subtasks")
 		}
@@ -483,11 +480,11 @@ func (app *MigratorApp) MigrateChildren(parent *jira.Issue) (err error) {
 		app.Progress.MarkMigratedParent(child.Key, app.Progress.MigratedKey(parent.Key))
 
 		errg.Go(func() error {
-			_, err := app.MigrateIssue(&child)
+			_, err := app.MigrateIssue(ctx, &child)
 			if err != nil {
 				return errors.Wrap(err, "unable to migrate child")
 			}
-			if err := app.MigrateChildren(&child); err != nil {
+			if err := app.MigrateChildren(ctx, &child); err != nil {
 				return errors.Wrap(err, "unable to migrate children's children")
 			}
 			return nil
@@ -497,7 +494,7 @@ func (app *MigratorApp) MigrateChildren(parent *jira.Issue) (err error) {
 	return errg.Wait()
 }
 
-func (app *MigratorApp) GetParent(issue *jira.Issue) (*jira.Issue, error) {
+func (app *MigratorApp) GetParent(ctx context.Context, issue *jira.Issue) (*jira.Issue, error) {
 	var parentKey string
 	if parent := issue.Fields.Parent; parent != nil {
 		parentKey = parent.Key
@@ -509,7 +506,7 @@ func (app *MigratorApp) GetParent(issue *jira.Issue) (*jira.Issue, error) {
 		return nil, nil
 	}
 
-	parents, err := app.QueryIssues(app.Server, `issue = `+parentKey)
+	parents, err := app.QueryIssues(ctx, app.Server, `issue = `+parentKey)
 	if err != nil {
 		return nil, err
 	}
@@ -534,16 +531,16 @@ func (app *MigratorApp) GetParent(issue *jira.Issue) (*jira.Issue, error) {
 // }
 
 // Migrates every parent up to root, but doesn't bother with siblings or cousins
-func (app *MigratorApp) MigrateParents(issue *jira.Issue) error {
-	parent, err := app.GetParent(issue)
+func (app *MigratorApp) MigrateParents(ctx context.Context, issue *jira.Issue) error {
+	parent, err := app.GetParent(ctx, issue)
 	if err != nil {
 		errors.Wrap(err, "unable to get parent")
 	}
 	if parent != nil {
-		if err := app.MigrateParents(parent); err != nil {
+		if err := app.MigrateParents(ctx, parent); err != nil {
 			return err
 		}
-		migratedParentKey, err := app.MigrateIssue(parent)
+		migratedParentKey, err := app.MigrateIssue(ctx, parent)
 		if err != nil {
 			return err
 		}
@@ -552,29 +549,33 @@ func (app *MigratorApp) MigrateParents(issue *jira.Issue) error {
 	return nil
 }
 
-func (app *MigratorApp) MigrateIssue(issue *jira.Issue) (string, error) {
+func (app *MigratorApp) MigrateIssue(ctx context.Context, issue *jira.Issue) (string, error) {
 	key, err, _ := app.migrateGroup.Do(issue.Key, func() (interface{}, error) {
-		return app.migrateIssue(issue)
+		fmt.Println("Migrating", issue.Key)
+		if key, err := app.migrateIssue(ctx, issue); err != nil {
+			fmt.Printf("Error migrating %s: %v\n", issue.Key, err)
+			return nil, err
+		} else {
+			fmt.Println("Successfully migrated", issue.Key, "to", key)
+			return key, nil
+		}
 	})
 	return key.(string), err
 }
 
-func (app *MigratorApp) migrateIssue(issue *jira.Issue) (key string, err error) {
+func (app *MigratorApp) migrateIssue(ctx context.Context, issue *jira.Issue) (key string, err error) {
 	defer func() {
 		if err == nil {
 			app.Progress.MarkMigrated(issue.Key, key)
 		}
 	}()
 
-	fmt.Println("Migrating", issue.Key, "...")
-
 	// First, check to see if this issue has already been migrated, and skip if so.
-	migratedIssues, err := app.QueryIssues(app.Cloud, `issue in issuesWithRemoteLinksByGlobalId("`+issue.Key+`") ORDER BY key DESC`)
+	migratedIssues, err := app.QueryIssues(ctx, app.Cloud, `issue in issuesWithRemoteLinksByGlobalId("`+issue.Key+`") ORDER BY key DESC`)
 	if err != nil {
 		return "", err
 	}
 	if len(migratedIssues) > 0 {
-		fmt.Println(issue.Key, "already migrated "+issue.Key+". Skipping.")
 		return migratedIssues[0].Key, nil
 	}
 
@@ -626,17 +627,15 @@ func (app *MigratorApp) migrateIssue(issue *jira.Issue) (key string, err error) 
 		}
 	}
 
-	migrated, _, err := app.Cloud.Issue.Create(&newIssue)
+	migrated, _, err := app.Cloud.Issue.CreateWithContext(ctx, &newIssue)
 	if err != nil {
-		b, _ := json.Marshal(newIssue)
-		panic(string(b))
-		return "", errors.Wrap(err, "Error creating issue")
+		return "", errors.Wrapf(err, "Error creating issue for %s", issue.Key)
 	}
 
 	errg := errgroup.Group{}
 
 	errg.Go(func() error {
-		if _, _, err := app.Cloud.Issue.AddRemoteLink(migrated.ID, &jira.RemoteLink{
+		if _, _, err := app.Cloud.Issue.AddRemoteLinkWithContext(ctx, migrated.ID, &jira.RemoteLink{
 			GlobalID: issue.Key,
 			Application: &jira.RemoteLinkApplication{
 				Type: "jira.etsycorp.com",
@@ -658,7 +657,7 @@ func (app *MigratorApp) migrateIssue(issue *jira.Issue) (key string, err error) 
 		errg.Go(func() error {
 			for _, comment := range issue.Fields.Comments.Comments {
 				comment := comment
-				if _, _, err := app.Cloud.Issue.AddComment(migrated.ID, &jira.Comment{
+				if _, _, err := app.Cloud.Issue.AddCommentWithContext(ctx, migrated.ID, &jira.Comment{
 					Name: comment.Name,
 					// It's impossible to set a different author than "self",
 					// so just indicate who wrote this originally in the body of the comment.
@@ -677,12 +676,12 @@ func (app *MigratorApp) migrateIssue(issue *jira.Issue) (key string, err error) 
 		attachment := attachment
 		errg.Go(func() error {
 			req, _ := http.NewRequest("GET", attachment.Content, nil)
-			resp, err := app.Server.Do(req, nil)
+			resp, err := app.Server.Do(req.WithContext(ctx), nil)
 			if err != nil {
 				return errors.Wrapf(err, "Error fetching attachment %q server issue %s", attachment.Filename, issue.Key)
 			}
 			defer resp.Body.Close()
-			if _, _, err := app.Cloud.Issue.PostAttachment(migrated.ID, resp.Body, attachment.Filename); err != nil {
+			if _, _, err := app.Cloud.Issue.PostAttachmentWithContext(ctx, migrated.ID, resp.Body, attachment.Filename); err != nil {
 				return errors.Wrapf(err, "Error posting attachment %q to issue %s", attachment.Filename, migrated.Key)
 			}
 			return nil
@@ -691,13 +690,13 @@ func (app *MigratorApp) migrateIssue(issue *jira.Issue) (key string, err error) 
 
 	errg.Go(func() error {
 		// Transition the ticket to the correct status
-		transitions, _, err := app.Cloud.Issue.GetTransitions(migrated.ID)
+		transitions, _, err := app.Cloud.Issue.GetTransitionsWithContext(ctx, migrated.ID)
 		if err != nil {
 			return errors.Wrapf(err, "Error fetching transitions for %s", migrated.Key)
 		}
 		for _, transition := range transitions {
 			if transition.To.Name == issue.Fields.Status.Name {
-				if _, err := app.Cloud.Issue.DoTransition(migrated.ID, transition.ID); err != nil {
+				if _, err := app.Cloud.Issue.DoTransitionWithContext(ctx, migrated.ID, transition.ID); err != nil {
 					return errors.Wrapf(err, "Error transitioning issue %s to %q", migrated.Key, transition.To.Name)
 				}
 			}
@@ -708,8 +707,6 @@ func (app *MigratorApp) migrateIssue(issue *jira.Issue) (key string, err error) 
 	if err := errg.Wait(); err != nil {
 		return "", errors.Wrapf(err, "Error migrating %s", issue.Key)
 	}
-
-	fmt.Println("Successfully migrated", issue.Key, "to", migrated.Key)
 
 	return migrated.Key, nil
 }
