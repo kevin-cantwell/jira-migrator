@@ -65,7 +65,7 @@ var (
 )
 
 func main() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	log.SetFlags(log.LstdFlags)
 
 	cliapp := &cli.App{
 		Name:  "jira-migrator",
@@ -113,7 +113,7 @@ func main() {
 
 					u, err := url.Parse(c.Args().First())
 					if err != nil {
-						return errors.Wrap(err, "invalid URL")
+						return errors.WithStack(err)
 					}
 					if u.Host == "" {
 						u.Scheme = "https"
@@ -128,7 +128,7 @@ func main() {
 						},
 					}).Client(), "https://"+u.Host)
 					if err != nil {
-						return errors.Wrap(err, "unable to create jira client")
+						return errors.WithStack(err)
 					}
 
 					req, err := http.NewRequest("GET", u.String(), nil)
@@ -138,7 +138,7 @@ func main() {
 
 					var body json.RawMessage
 					if _, err := client.Do(req, &body); err != nil {
-						return errors.Wrap(err, "invalid URL")
+						return errors.WithStack(err)
 					}
 					return nil
 				},
@@ -190,7 +190,7 @@ func main() {
 						fmt.Println(string(b))
 						return nil
 					}); err != nil {
-						return errors.Wrap(err, "unable to search pages")
+						return errors.WithStack(err)
 					}
 
 					return nil
@@ -242,7 +242,7 @@ func main() {
 
 					app, err := NewMigratorApp(*config)
 					if err != nil {
-						return errors.Wrap(err, "unable to configure app")
+						return errors.WithStack(err)
 					}
 
 					ctx, cancel := context.WithCancel(context.Background())
@@ -259,21 +259,21 @@ func main() {
 							}()
 
 							if err := app.MigrateParents(ctx, &issue); err != nil {
-								return errors.Wrap(err, "unable to migrate parents")
+								return errors.WithStack(err)
 							}
 							if _, err = app.MigrateIssue(ctx, &issue); err != nil {
-								return errors.Wrap(err, "unable to migrate issue")
+								return errors.WithStack(err)
 							}
 							if children {
 								if err := app.MigrateChildren(ctx, &issue); err != nil {
-									return errors.Wrap(err, "unable to migrate children")
+									return errors.WithStack(err)
 								}
 							}
 							return nil
 						})
 						return nil
 					}); err != nil {
-						return errors.Wrap(err, "unable to search pages")
+						return errors.WithStack(err)
 					}
 
 					return errg.Wait()
@@ -284,7 +284,7 @@ func main() {
 
 	err := cliapp.Run(os.Args)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("%+v\n", err)
 	}
 
 	return
@@ -440,6 +440,8 @@ func (tr *BackoffTransport) roundTrip(backoff time.Duration, req *http.Request) 
 		return nil, err
 	}
 
+	reqDump, _ := httputil.DumpRequestOut(req, true)
+
 	resp, err := http.DefaultTransport.RoundTrip(req)
 	if err != nil {
 		return nil, err
@@ -476,9 +478,8 @@ func (tr *BackoffTransport) roundTrip(backoff time.Duration, req *http.Request) 
 		}
 	default:
 		if resp.StatusCode >= 400 {
-			reqDump, _ := httputil.DumpRequest(req, true)
 			respDump, _ := httputil.DumpResponse(resp, true)
-			fmt.Println(string(reqDump) + string(respDump))
+			fmt.Fprint(os.Stdout, string(reqDump)+"\n"+string(respDump)+"\n")
 
 			log.Println(req.URL.Host, req.Method, req.URL.Path, http.StatusText(resp.StatusCode), "Backing off for", backoff)
 			select {
@@ -504,7 +505,7 @@ type MigratorApp struct {
 	// Ensures that we only migrate each issue once without having to implement fancy
 	// deduplication logic for this unit of work
 	migrateIssueOnce singleflight.Group
-	createSprintOnce singleflight.Group
+	onceEach         singleflight.Group
 }
 
 func newClient(creds Credentials, rateLimit int) (*jira.Client, error) {
@@ -556,7 +557,7 @@ func (app *MigratorApp) QueryIssues(ctx context.Context, client *jira.Client, jq
 		issues = append(issues, issue)
 		return nil
 	}); err != nil {
-		return nil, errors.Wrap(err, "unable to search pages")
+		return nil, errors.WithStack(err)
 	}
 	return issues, nil
 }
@@ -568,13 +569,13 @@ func (app *MigratorApp) MigrateChildren(ctx context.Context, parent *jira.Issue)
 	if parent.Fields.Type.Name == "Epic" {
 		children, err = app.QueryIssues(ctx, app.Server, `"Epic Link" = `+parent.Key+` ORDER BY key`)
 		if err != nil {
-			return errors.Wrap(err, "unable to query epic children")
+			return errors.WithStack(err)
 		}
 	}
 	if len(parent.Fields.Subtasks) > 0 {
 		children, err = app.QueryIssues(ctx, app.Server, `parent in ("`+parent.Key+`") ORDER BY key`)
 		if err != nil {
-			return errors.Wrap(err, "unable to query subtasks")
+			return errors.WithStack(err)
 		}
 	}
 
@@ -590,10 +591,10 @@ func (app *MigratorApp) MigrateChildren(ctx context.Context, parent *jira.Issue)
 		errg.Go(func() error {
 			_, err := app.MigrateIssue(ctx, &child)
 			if err != nil {
-				return errors.Wrap(err, "unable to migrate child")
+				return errors.WithStack(err)
 			}
 			if err := app.MigrateChildren(ctx, &child); err != nil {
-				return errors.Wrap(err, "unable to migrate children's children")
+				return errors.WithStack(err)
 			}
 			return nil
 		})
@@ -630,7 +631,7 @@ func (app *MigratorApp) GetParent(ctx context.Context, issue *jira.Issue) (*jira
 // 	// If it's a subtask or has an epic, migrate its parent first.
 // 	parent, err := app.GetParent(issue)
 // 	if err != nil {
-// 		errors.Wrap(err, "unable to get parent")
+// 		errors.WithStack(err)
 // 	}
 // 	if parent != nil {
 // 		return app.GetParentRoot(parent)
@@ -642,7 +643,7 @@ func (app *MigratorApp) GetParent(ctx context.Context, issue *jira.Issue) (*jira
 func (app *MigratorApp) MigrateParents(ctx context.Context, issue *jira.Issue) error {
 	parent, err := app.GetParent(ctx, issue)
 	if err != nil {
-		errors.Wrap(err, "unable to get parent")
+		errors.WithStack(err)
 	}
 	if parent != nil {
 		if err := app.MigrateParents(ctx, parent); err != nil {
@@ -659,16 +660,30 @@ func (app *MigratorApp) MigrateParents(ctx context.Context, issue *jira.Issue) e
 
 func (app *MigratorApp) MigrateIssue(ctx context.Context, issue *jira.Issue) (string, error) {
 	key, err, _ := app.migrateIssueOnce.Do(issue.Key, func() (interface{}, error) {
-		fmt.Println("Migrating", issue.Key)
+		log.Println("Migrating", issue.Key)
 		if key, err := app.migrateIssue(ctx, issue); err != nil {
-			fmt.Printf("Error migrating %s: %v\n", issue.Key, err)
+			log.Printf("Error migrating %s: %v\n", issue.Key, err)
 			return nil, err
 		} else {
-			fmt.Println("Successfully migrated", issue.Key, "to", key)
+			log.Println("Successfully migrated", issue.Key, "to", key)
 			return key, nil
 		}
 	})
-	return key.(string), err
+	if err != nil {
+		return "", err
+	}
+	return key.(string), nil
+}
+
+func (app *MigratorApp) queryForMigratedIssue(ctx context.Context, key string) (*jira.Issue, error) {
+	migratedIssues, err := app.QueryIssues(ctx, app.Cloud, `project = `+app.ProjectKey+` AND issue in issuesWithRemoteLinksByGlobalId("`+key+`") ORDER BY key DESC`)
+	if err != nil {
+		return nil, err
+	}
+	if len(migratedIssues) > 0 {
+		return &migratedIssues[0], nil
+	}
+	return nil, nil
 }
 
 func (app *MigratorApp) migrateIssue(ctx context.Context, issue *jira.Issue) (key string, err error) {
@@ -679,12 +694,12 @@ func (app *MigratorApp) migrateIssue(ctx context.Context, issue *jira.Issue) (ke
 	}()
 
 	// First, check to see if this issue has already been migrated, and skip if so.
-	migratedIssues, err := app.QueryIssues(ctx, app.Cloud, `project = `+app.ProjectKey+` AND issue in issuesWithRemoteLinksByGlobalId("`+issue.Key+`") ORDER BY key DESC`)
+	migratedIssue, err := app.queryForMigratedIssue(ctx, issue.Key)
 	if err != nil {
 		return "", err
 	}
-	if len(migratedIssues) > 0 {
-		return migratedIssues[0].Key, nil
+	if migratedIssue != nil {
+		return migratedIssue.Key, nil
 	}
 
 	newIssue := jira.Issue{
@@ -757,7 +772,7 @@ func (app *MigratorApp) migrateIssue(ctx context.Context, issue *jira.Issue) (ke
 			GlobalID: issue.Key,
 			Application: &jira.RemoteLinkApplication{
 				Type: "jira.etsycorp.com",
-				Name: "Migrated Issue",
+				Name: "jira.etsycorp.com",
 			},
 			Object: &jira.RemoteLinkObject{
 				URL:     "https://jira.etsycorp.com/browse/" + issue.Key,
@@ -765,10 +780,92 @@ func (app *MigratorApp) migrateIssue(ctx context.Context, issue *jira.Issue) (ke
 				Summary: issue.Fields.Summary,
 			},
 		}); err != nil {
-			return errors.Wrap(err, "Error creating remote link")
+			return errors.WithStack(err)
 		}
 		return nil
 	})
+
+	for _, link := range issue.Fields.IssueLinks {
+		link := link
+		errg.Go(func() error {
+			if link.OutwardIssue != nil {
+				errg.Go(func() error {
+					if _, _, err := app.Cloud.Issue.AddRemoteLinkWithContext(ctx, migrated.ID, &jira.RemoteLink{
+						GlobalID: fmt.Sprintf("%s-outward-%s-%s", link.Type.ID, issue.Key, link.OutwardIssue.Key),
+						Application: &jira.RemoteLinkApplication{
+							Type: "jira.etsycorp.com",
+							Name: "jira.etsycorp.com",
+						},
+						Object: &jira.RemoteLinkObject{
+							URL:     "https://jira.etsycorp.com/browse/" + link.OutwardIssue.Key,
+							Title:   link.Type.Outward + " " + link.OutwardIssue.Key,
+							Summary: link.OutwardIssue.Fields.Summary,
+						},
+					}); err != nil {
+						return errors.WithStack(err)
+					}
+					return nil
+				})
+				outwardIssue, err := app.queryForMigratedIssue(ctx, link.OutwardIssue.Key)
+				if err != nil {
+					return err
+				}
+				if outwardIssue != nil {
+					linkType, err := app.linkTypeBestFit(ctx, link.Type.Outward)
+					if err != nil {
+						return err
+					}
+					// Then establish link
+					if _, err := app.Cloud.Issue.AddLinkWithContext(ctx, &jira.IssueLink{
+						Type:         *linkType,
+						InwardIssue:  &jira.Issue{ID: migrated.ID},
+						OutwardIssue: &jira.Issue{ID: outwardIssue.ID},
+					}); err != nil {
+						return err
+					}
+					return nil
+				}
+			} else {
+				errg.Go(func() error {
+					if _, _, err := app.Cloud.Issue.AddRemoteLinkWithContext(ctx, migrated.ID, &jira.RemoteLink{
+						GlobalID: fmt.Sprintf("%s-inward-%s-%s", link.Type.ID, issue.Key, link.InwardIssue.Key),
+						Application: &jira.RemoteLinkApplication{
+							Type: "jira.etsycorp.com",
+							Name: "jira.etsycorp.com",
+						},
+						Object: &jira.RemoteLinkObject{
+							URL:     "https://jira.etsycorp.com/browse/" + link.InwardIssue.Key,
+							Title:   link.Type.Inward + " " + link.InwardIssue.Key,
+							Summary: link.InwardIssue.Fields.Summary,
+						},
+					}); err != nil {
+						return errors.WithStack(err)
+					}
+					return nil
+				})
+				inwardIssue, err := app.queryForMigratedIssue(ctx, link.InwardIssue.Key)
+				if err != nil {
+					return err
+				}
+				if inwardIssue != nil {
+					linkType, err := app.linkTypeBestFit(ctx, link.Type.Inward)
+					if err != nil {
+						return err
+					}
+					// Then establish link
+					if _, err := app.Cloud.Issue.AddLinkWithContext(ctx, &jira.IssueLink{
+						Type:         *linkType,
+						InwardIssue:  &jira.Issue{ID: inwardIssue.ID},
+						OutwardIssue: &jira.Issue{ID: migrated.ID},
+					}); err != nil {
+						return err
+					}
+					return nil
+				}
+			}
+			return nil
+		})
+	}
 
 	// Comments can't be set on create. They must be added later
 	if issue.Fields.Comments != nil {
@@ -827,6 +924,67 @@ func (app *MigratorApp) migrateIssue(ctx context.Context, issue *jira.Issue) (ke
 	}
 
 	return migrated.Key, nil
+}
+
+func (app *MigratorApp) linkTypeBestFit(ctx context.Context, name string) (*jira.IssueLinkType, error) {
+	linkTypeLookup, err := app.lookupAllLinkTypes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	linkType, ok := linkTypeLookup[name]
+	if !ok {
+		linkType = linkTypeLookup["Relates"]
+	}
+	return &linkType, nil
+}
+
+func (app *MigratorApp) lookupLinkTypeByName(ctx context.Context, name string) (*jira.IssueLinkType, bool, error) {
+	linkTypeLookup, err := app.lookupAllLinkTypes(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	linkType, ok := linkTypeLookup[name]
+	if !ok {
+		return nil, false, nil
+	}
+	return &linkType, true, nil
+}
+
+func (app *MigratorApp) lookupAllLinkTypes(ctx context.Context) (map[string]jira.IssueLinkType, error) {
+	types, err, _ := app.onceEach.Do("lookupAllLinkTypes", func() (interface{}, error) {
+		linkTypes, _, err := app.getIssueLinkTypesWithContext(ctx)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		lookup := map[string]jira.IssueLinkType{}
+		for _, linkType := range linkTypes {
+			lookup[linkType.Name] = linkType
+			lookup[linkType.Outward] = linkType
+			lookup[linkType.Inward] = linkType
+		}
+		return lookup, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return types.(map[string]jira.IssueLinkType), nil
+}
+
+func (app *MigratorApp) getIssueLinkTypesWithContext(ctx context.Context) ([]jira.IssueLinkType, *jira.Response, error) {
+	apiEndpoint := "rest/api/2/issueLinkType"
+	req, err := app.Cloud.NewRequestWithContext(ctx, "GET", apiEndpoint, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	linkTypeList := struct {
+		IssueLinkTypes []jira.IssueLinkType `json:"issueLinkTypes"`
+	}{}
+	resp, err := app.Cloud.Do(req, &linkTypeList)
+	if err != nil {
+		return nil, resp, jira.NewJiraError(resp, err)
+	}
+	return linkTypeList.IssueLinkTypes, resp, nil
 }
 
 func epicKey(issue *jira.Issue) string {

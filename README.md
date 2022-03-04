@@ -9,14 +9,15 @@ A hacky tool for migrating issues from Jira Server to Jira Cloud.
 * You may optionally migrate child issues.
 * If an issue is a subtask or has an epic, its parent will also be migrated to maintain issue heirarchy. Siblings and cousins (ie: parent's children or parent's parent's children) will not, unless they also appear in the JQL results.
 * "Backlinks" to the original Jira Server issue will appear in the migrated issue as a remote link.
+* Issue links will migrate.
 
 #### Non-features
 * Sprints or boards cannot be migrated
-* Issue links are not migrated
 
 #### Known issues
 * Priority does not migrate: https://github.com/kevin-cantwell/jira-migrator/issues/1
 * This tool uses Jira's v2 REST api, which may not work as expected against some servers.
+* Some issue link types will not exist on the target server. In such cases, the "Relates" issue link type will be used instead as a catch all.
 
 # Installation
 You can grab a binary from the [releases page](https://github.com/kevin-cantwell/jira-migrator/releases).
