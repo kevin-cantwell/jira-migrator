@@ -22,28 +22,44 @@ import (
 	yaml "gopkg.in/yaml.v2"
 )
 
-var DefaultSearchFields = []string{
-	"project",
-	"summary",
-	"status",
-	"description",
-	"created",
-	"creator",
-	"updated",
-	"resolutiondate",
-	"issuelinks",
-	"issuetype",
-	"labels",
-	"assignee",
-	"reporter",
-	"comment",
-	"attachment",
-	"priority",
-	"parent",
-	"subtasks",
-	"customfield_10620", // epic key
-	"customfield_10621", // epic name
-}
+var (
+	DefaultSearchFields = []string{
+		"project",
+		"sprint", // Doesn't seem to do anything
+		"summary",
+		"status",
+		"description",
+		"created",
+		"creator",
+		"updated",
+		"resolutiondate",
+		"issuelinks",
+		"issuetype",
+		"labels",
+		"assignee",
+		"reporter",
+		"comment",
+		"attachment",
+		"priority",
+		"parent",
+		"subtasks",
+		"customfield_10620", // epic key
+		"customfield_10621", // epic name
+		"customfield_10222", // sprint (only for Jira Server)
+		/*
+				customfield_10222": [
+			      "com.atlassian.greenhopper.service.sprint.Sprint@1da092b0[id=9090,rapidViewId=1151,state=CLOSED,name=Apple Platz,startDate=2021-11-11T20:11:47.619Z,endDate=2021-11-25T23:11:00.000Z,completeDate=2021-12-02T19:41:10.134Z,sequence=9090,goal=]",
+			      "com.atlassian.greenhopper.service.sprint.Sprint@2076d393[id=9192,rapidViewId=1151,state=CLOSED,name=Black Forest,startDate=2021-12-02T20:13:17.127Z,endDate=2021-12-16T23:13:00.000Z,completeDate=2021-12-16T19:51:01.534Z,sequence=9192,goal=]",
+			      "com.atlassian.greenhopper.service.sprint.Sprint@597e8670[id=9267,rapidViewId=1151,state=CLOSED,name=Candy Cane Mochi,startDate=2021-12-16T19:52:25.001Z,endDate=2021-12-30T22:52:00.000Z,completeDate=2022-01-06T19:44:14.566Z,sequence=9267,goal=]",
+			      "com.atlassian.greenhopper.service.sprint.Sprint@5540a235[id=9350,rapidViewId=1151,state=CLOSED,name=Stale Gingerbread House,startDate=2022-01-06T20:09:09.291Z,endDate=2022-01-20T23:09:00.000Z,completeDate=2022-01-20T19:55:49.513Z,sequence=9350,goal=]",
+			      "com.atlassian.greenhopper.service.sprint.Sprint@51fb0b5[id=9441,rapidViewId=1151,state=CLOSED,name=Egg Wrap,startDate=2022-01-20T20:05:56.996Z,endDate=2022-02-03T23:05:00.000Z,completeDate=2022-02-03T19:40:52.216Z,sequence=9441,goal=]",
+			      "com.atlassian.greenhopper.service.sprint.Sprint@7c7103bc[id=9544,rapidViewId=1151,state=CLOSED,name=Honey Cardamom Latte,startDate=2022-02-03T20:03:38.315Z,endDate=2022-02-17T23:03:00.000Z,completeDate=2022-02-17T18:20:45.197Z,sequence=9544,goal=]",
+			      "com.atlassian.greenhopper.service.sprint.Sprint@46c54791[id=9629,rapidViewId=1151,state=CLOSED,name=Morning Glory Muffin,startDate=2022-02-17T18:43:36.493Z,endDate=2022-03-03T21:43:00.000Z,completeDate=2022-03-03T18:13:07.991Z,sequence=9629,goal=]"
+			    ],
+		*/
+	}
+	DefaultRateLimit = 7
+)
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
@@ -91,7 +107,7 @@ func main() {
 						return errors.New("invalid host value: " + host)
 					}
 
-					client, err := newClient(creds, config.RateLimit)
+					client, err := newClient(creds, DefaultRateLimit)
 					if err != nil {
 						return err
 					}
@@ -129,7 +145,7 @@ func main() {
 					&cli.IntFlag{
 						Name:  "rate-limit",
 						Usage: "Set the api rate limit (max requests per second) to respect.",
-						Value: 7,
+						Value: DefaultRateLimit,
 					},
 				},
 				ArgsUsage: "DESTINATION_PROJECT_KEY",
@@ -611,10 +627,12 @@ func (app *MigratorApp) migrateIssue(ctx context.Context, issue *jira.Issue) (ke
 		}
 	}
 
-	if sprint := issue.Fields.Sprint; sprint != nil {
+	// if the issue has a sprint and it's active, then migrate the sprint as well
+	if sprint := issue.Fields.Sprint; sprint != nil && sprint.CompleteDate == nil {
 		// newSprintID, err, _ := app.createSprintOnce.Do(sprint.Name, func() (interface{}, error) {
-		// 	app.Cloud.Sprint.CreateWithContext(ctx)
-		// 	return 0, err
+		// 	app.Cloud.Board.GetAllSprintsWithOptionsWithContext()
+		// 	// 	app.Cloud.Sprint.CreateWithContext(ctx)
+		// 	// 	return 0, err
 		// })
 		// if err != nil {
 		// 	return "", errors.Wrapf(err, "Error creating sprint %q", sprint.Name)
