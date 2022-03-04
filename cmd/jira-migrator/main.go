@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"os"
 	"strconv"
 	"sync"
@@ -77,11 +80,75 @@ func main() {
 		},
 		Commands: []*cli.Command{
 			{
+				Name:  "api-get",
+				Usage: "Execute authenticated GET requests",
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:  "host",
+						Usage: "The host to query. Valid values are \"server\" and \"cloud\"",
+						Value: "server",
+					},
+					&cli.BoolFlag{
+						Name:    "verbose",
+						Aliases: []string{"v"},
+						Usage:   "Dump request and response headers.",
+					},
+				},
+				ArgsUsage: "URL",
+				Action: func(c *cli.Context) error {
+					config, err := newConfigFromFile(c.String("config"))
+					if err != nil {
+						return err
+					}
+
+					var creds Credentials
+					switch host := c.String("host"); host {
+					case "server":
+						creds = config.Server
+					case "cloud":
+						creds = config.Cloud
+					default:
+						return errors.New("invalid host value: " + host)
+					}
+
+					u, err := url.Parse(c.Args().First())
+					if err != nil {
+						return errors.Wrap(err, "invalid URL")
+					}
+					if u.Host == "" {
+						u.Scheme = "https"
+						u.Host = creds.Host
+					}
+
+					client, err := jira.NewClient((&jira.BasicAuthTransport{
+						Username: creds.Username,
+						Password: creds.Password,
+						Transport: &VerboseTransport{
+							Verbose: c.Bool("verbose"),
+						},
+					}).Client(), "https://"+u.Host)
+					if err != nil {
+						return errors.Wrap(err, "unable to create jira client")
+					}
+
+					req, err := http.NewRequest("GET", u.String(), nil)
+					if err != nil {
+						return errors.Wrapf(err, "invalid request")
+					}
+
+					var body json.RawMessage
+					if _, err := client.Do(req, &body); err != nil {
+						return errors.Wrap(err, "invalid URL")
+					}
+					return nil
+				},
+			},
+			{
 				Name:  "inspect",
 				Usage: "Inspect issues",
 				Flags: []cli.Flag{
 					&cli.StringFlag{
-						Name:  "host,h",
+						Name:  "host",
 						Usage: "The host to query. Valid values are \"server\" and \"cloud\"",
 						Value: "server",
 					},
@@ -249,8 +316,44 @@ func newConfigFromFile(path string) (*Config, error) {
 	return &config, nil
 }
 
-func respErrExit(resp *jira.Response, err error) {
-	panic(err)
+type VerboseTransport struct {
+	Verbose bool
+}
+
+func (tr *VerboseTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	var reqDump []byte
+	if tr.Verbose {
+		reqDump, _ = httputil.DumpRequestOut(req, true)
+	}
+	resp, err := http.DefaultTransport.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	if tr.Verbose {
+		fmt.Fprint(os.Stderr, string(reqDump))
+		respDump, _ := httputil.DumpResponse(resp, false)
+		fmt.Fprint(os.Stderr, string(respDump))
+	}
+	body, saved, err := tr.drainBody(resp.Body)
+	io.Copy(os.Stdout, body)
+	resp.Body = saved
+	return resp, err
+}
+
+// to make the returned ReadClosers have identical error-matching behavior.
+func (tr *VerboseTransport) drainBody(b io.ReadCloser) (r1, r2 io.ReadCloser, err error) {
+	if b == nil || b == http.NoBody {
+		// No copying needed. Preserve the magic sentinel meaning of NoBody.
+		return http.NoBody, http.NoBody, nil
+	}
+	var buf bytes.Buffer
+	if _, err = buf.ReadFrom(b); err != nil {
+		return nil, b, err
+	}
+	if err = b.Close(); err != nil {
+		return nil, b, err
+	}
+	return io.NopCloser(&buf), io.NopCloser(bytes.NewReader(buf.Bytes())), nil
 }
 
 type ErrorResponse struct {
