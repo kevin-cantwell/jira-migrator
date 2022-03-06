@@ -22,6 +22,11 @@ A hacky tool for migrating issues from Jira Server to Jira Cloud.
 # Installation
 You can grab a binary from the [releases page](https://github.com/kevin-cantwell/jira-migrator/releases).
 
+Or install from tip using Go:
+```
+go install github.com/kevin-cantwell/jira-migrator/cmd/jira-migrator@latest
+```
+
 # Usage
 Create a file called `config.yaml` in your working directory that looks like this:
 ```yaml
