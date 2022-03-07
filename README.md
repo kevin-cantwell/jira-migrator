@@ -8,8 +8,8 @@ A hacky tool for migrating issues from Jira Server to Jira Cloud.
 * It is somwewhat idempodent in that it can be re-run without creating dupes. However, if the tool fails in the middle of a migration, migrated issues may be incomplete.
 * You may optionally migrate child issues.
 * If an issue is a subtask or has an epic, its parent will also be migrated to maintain issue heirarchy. Siblings and cousins (ie: parent's children or parent's parent's children) will not, unless they also appear in the JQL results.
-* "Backlinks" to the original Jira Server issue will appear in the migrated issue as a remote link.
-* Issue links will migrate.
+* Issue links are migrated, assuming the issue being linked to already exists on the target server.
+* "Backlinks" to the original Jira Server issue will appear in the migrated issue as a remote link, for posterity.
 
 #### Non-features
 * Sprints or boards cannot be migrated
@@ -40,8 +40,26 @@ cloud:
   password: "" # use an api key that you generate from your Jira account
 ```
 
-### Inspecting issues
-This command is read-only and can do no harm.
+### Commands
+
+#### api-get
+View the raw JSON response of an api method. Useful primarily for debugging this tool. This command is read-only.
+
+```
+NAME:
+   jira-migrator api-get - Execute authenticated GET requests
+
+USAGE:
+   jira-migrator api-get [command options] URL
+
+OPTIONS:
+   --host value   The host to query. Valid values are "server" and "cloud" (default: "server")
+   --verbose, -v  Dump request and response headers. (default: false)
+   --help, -h     show help (default: false)
+```
+
+#### inspect
+View the raw JSON response of an issue in the way the `migrate` command might view it. This command is read-only.
 
 ```
 NAME:
@@ -54,9 +72,10 @@ OPTIONS:
    --host value  The host to query. Valid values are "server" and "cloud" (default: "server")
    --jql value   The JQL query string to execute against the configured "server" server.
    --help, -h    show help (default: false)
+
 ```
 
-### Migrating issues
+#### migrate
 You'll need to do some prep on your target project before migrating:
 1. Ensure that, for every issue you're migrating, its type has a corresponding issue with the _*exact same name*_ in the cloud project.
 2. Ensure that, for every issue you're migrating, its status has a corresponding status with the _*exact same name*_ in the cloud project.
