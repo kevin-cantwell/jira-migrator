@@ -209,6 +209,10 @@ func main() {
 						Name:  "children",
 						Usage: "Set if you want to migrate all child issues.",
 					},
+					&cli.BoolFlag{
+						Name:  "rename-subtask",
+						Usage: "Rename Sub-Task to Subtask",
+					},
 					&cli.IntFlag{
 						Name:  "rate-limit",
 						Usage: "Set the api rate limit (max requests per second) to respect.",
@@ -221,6 +225,7 @@ func main() {
 						configFile = c.String("config")
 						jql        = c.String("jql")
 						children   = c.Bool("children")
+						renameSubtask   = c.Bool("rename-subtask")
 						rateLimit  = c.Int("rate-limit")
 						projectKey = c.Args().First()
 
@@ -239,6 +244,7 @@ func main() {
 					// add flag-based configs
 					config.ProjectKey = projectKey
 					config.RateLimit = rateLimit
+					config.RenameSubtask = renameSubtask
 
 					app, err := NewMigratorApp(*config)
 					if err != nil {
@@ -295,6 +301,7 @@ type Config struct {
 	Cloud      Credentials `yaml:"cloud"`
 	ProjectKey string
 	RateLimit  int
+	RenameSubtask bool
 }
 
 type Credentials struct {
@@ -501,6 +508,7 @@ type MigratorApp struct {
 	ProjectKey string
 	UserLookup map[string]jira.User
 	Progress   *Progress
+	RenameSubtask bool
 
 	// Ensures that we only migrate each issue once without having to implement fancy
 	// deduplication logic for this unit of work
@@ -545,6 +553,7 @@ func NewMigratorApp(config Config) (*MigratorApp, error) {
 		ProjectKey: config.ProjectKey,
 		UserLookup: userLookup,
 		Progress:   NewProgress(),
+		RenameSubtask: config.RenameSubtask,
 	}, nil
 }
 
@@ -719,13 +728,19 @@ func (app *MigratorApp) migrateIssue(ctx context.Context, issue *jira.Issue) (ke
 		return migratedIssue.Key, nil
 	}
 
+	// rename Sub-Task to Subtask
+	var issueType = issue.Fields.Type.Name
+	if issueType == "Sub-Task" && app.RenameSubtask {
+		issueType = "Subtask"
+	}
+
 	newIssue := jira.Issue{
 		Fields: &jira.IssueFields{
 			Project: jira.Project{
 				Key: app.ProjectKey,
 			},
 			Type: jira.IssueType{
-				Name: issue.Fields.Type.Name,
+				Name: issueType,
 			},
 			Summary:     issue.Fields.Summary,
 			Description: issue.Fields.Description,
