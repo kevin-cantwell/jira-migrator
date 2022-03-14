@@ -92,6 +92,7 @@ USAGE:
 OPTIONS:
    --jql value         The JQL query string to execute against the configured "server" server.
    --children          Set if you want to migrate all child issues. (default: false)
+   --rename-subtask    Rename Sub-Task to Subtask (default: false)
    --rate-limit value  Set the api rate limit (max requests per second) to respect. (default: 7)
    --help, -h          show help (default: false)
 ```
